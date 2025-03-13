@@ -18,7 +18,7 @@ class fread(angr.SimProcedure):
             return -1
 
         ret = simfd.read(dst, size * nm)
-        return claripy.If(claripy.Or(size == 0, nm == 0), 0, ret // size)
+        return claripy.If(claripy.Or(size == 0, nm == 0), 0, ret // (size + (size == 0)))
 
 
 fread_unlocked = fread
