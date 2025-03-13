@@ -599,7 +599,14 @@ class Tracer(ExplorationTechnique):
             pass
         elif self.project.is_hooked(state.addr) and not self.project.loader.extern_object.contains_addr(state.addr):
             # handle simprocedures
-            self._sync_return(state, idx)
+            proc = self.project.hooked_by(state.addr)
+            if proc and proc.NO_RET:
+                # procedure does not return: do not attempt
+                # to synchronise with return address!
+                # will be dealt with later by fast-forward case
+                pass
+            else:
+                self._sync_return(state, idx)
         elif self._compare_addr(self._trace[idx + 1], state.addr):
             # normal case
             state.globals["trace_idx"] = idx + 1
