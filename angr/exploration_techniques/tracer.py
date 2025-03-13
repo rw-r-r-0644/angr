@@ -623,13 +623,8 @@ class Tracer(ExplorationTechnique):
                 orig_addr = self.project.loader.find_symbol(proc.display_name).rebased_addr
                 obj = self.project.loader.find_object_containing(orig_addr)
                 orig_trace_addr = self._translate_state_addr(orig_addr, obj)
-                if 0 <= self._trace[idx + 1] - orig_trace_addr <= 0x10000:
-                    # this is fine. we do nothing and then next round
-                    # it'll get handled by the is_hooked(state.history.addr) case
-                    pass
-                else:
-                    # this may also be triggered as a consequence of the unicorn issue linked above
-                    raise Exception("BUG: State is returning to a continuation that isn't its own???")
+                # this is fine. we do nothing and then next round
+                # it'll get handled by the is_hooked(state.history.addr) case
             elif state.addr == getattr(self.project.simos, "vsyscall_addr", None):
                 if not self._sync_callsite(state, idx, state.history.addr):
                     raise AngrTracerError("Could not synchronize following vsyscall")
