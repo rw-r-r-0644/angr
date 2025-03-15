@@ -562,6 +562,37 @@ class SimSystemPosix(SimStatePlugin):
             result,
         )
 
+    def openat(self, sim_dirfd, path, flags):
+        flags = self.state.solver.eval(flags)
+        dirfd = self.state.solver.eval_one(sim_dirfd)
+
+        # resolve parent path
+        if path.startswith(b'/'):
+            parent = b''
+        elif dirfd == 0xffffff9c:
+            # If path is absolute or dirfd is AT_FDCWD(-100), dirfd can be ignored.
+            # Sometimes dirfd can be a 32 bit value in a 64 bit BV. So, instead of converting dirfd to signed integer, we
+            # simply check the unsigned value.
+            # TODO: Is above described way to check dirfd okay?
+            parent = self.state.fs.cwd
+        elif 0 <= fd and fd < max_fds:
+            dirfd_desc = self.state.posix.get_fd(dirfd)
+
+            # a fd can be SimFileDescriptorDuplex which is not backed by a file
+            if not isinstance(dirfd_desc, SimFileDescriptor):
+                return -1
+
+            parent = dirfd_desc.file
+        else:
+            return -1
+
+        # form full path
+        parent = parent.lstrip(b'file://').rstrip(b'/')
+        path = path.lstrip(b'/')
+        abs_path = parent + b'/' + path
+
+        return self.open(abs_path, Flags.O_RDONLY)
+
     def sigmask(self, sigsetsize=None):
         """
         Gets the current sigmask. If it's blank, a new one is created (of sigsetsize).
