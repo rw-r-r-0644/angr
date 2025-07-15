@@ -32,3 +32,5 @@ dist
 *.db
 *.dylib
 docs/_build
+uv.lock
+target/

@@ -17,7 +17,6 @@ from archinfo.arch_arm import is_arm_arch, get_real_address_if_arm
 from angr.knowledge_plugins.functions.function_manager import FunctionManager
 from angr.knowledge_plugins.functions.function import Function
 from angr.knowledge_plugins.cfg import IndirectJump, CFGNode, CFGENode, CFGModel  # pylint:disable=unused-import
-from angr.misc.ux import deprecated
 from angr.procedures.stubs.UnresolvableJumpTarget import UnresolvableJumpTarget
 from angr.utils.constants import DEFAULT_STATEMENT
 from angr.procedures.procedure_dict import SIM_PROCEDURES
@@ -354,63 +353,8 @@ class CFGBase(Analysis):
 
         raise NotImplementedError("I'm too lazy to implement it right now")
 
-    @deprecated(replacement="self.model.get_predecessors()")
-    def get_predecessors(self, cfgnode, excluding_fakeret=True, jumpkind=None):
-        return self._model.get_predecessors(cfgnode, excluding_fakeret=excluding_fakeret, jumpkind=jumpkind)
-
-    @deprecated(replacement="self.model.get_successors()")
-    def get_successors(self, node, excluding_fakeret=True, jumpkind=None):
-        return self._model.get_successors(node, excluding_fakeret=excluding_fakeret, jumpkind=jumpkind)
-
-    @deprecated(replacement="self.model.get_successors_and_jumpkind")
-    def get_successors_and_jumpkind(self, node, excluding_fakeret=True):
-        return self._model.get_successors_and_jumpkind(node, excluding_fakeret=excluding_fakeret)
-
-    @deprecated(replacement="self.model.get_all_predecessors()")
-    def get_all_predecessors(self, cfgnode, depth_limit=None):
-        return self._model.get_all_predecessors(cfgnode, depth_limit)
-
-    @deprecated(replacement="self.model.get_all_successors()")
-    def get_all_successors(self, cfgnode, depth_limit=None):
-        return self._model.get_all_successors(cfgnode, depth_limit)
-
-    @deprecated(replacement="self.model.get_node()")
-    def get_node(self, block_id):
-        return self._model.get_node(block_id)
-
-    @deprecated(replacement="self.model.get_any_node()")
-    def get_any_node(self, addr, is_syscall=None, anyaddr=False, force_fastpath=False):
-        return self._model.get_any_node(addr, is_syscall=is_syscall, anyaddr=anyaddr, force_fastpath=force_fastpath)
-
-    @deprecated(replacement="self.model.get_all_nodes()")
-    def get_all_nodes(self, addr, is_syscall=None, anyaddr=False):
-        return self._model.get_all_nodes(addr, is_syscall=is_syscall, anyaddr=anyaddr)
-
-    @deprecated(replacement="self.model.nodes()")
-    def nodes(self):
-        return self._model.nodes()
-
-    @deprecated(replacement="nodes")
-    def nodes_iter(self):
-        """
-        (Decrepated) An iterator of all nodes in the graph. Will be removed in the future.
-
-        :return: The iterator.
-        :rtype: iterator
-        """
-
-        return self.nodes()
-
     def get_loop_back_edges(self):
         return self._loop_back_edges
-
-    @deprecated(replacement="self.model.get_branching_nodes()")
-    def get_branching_nodes(self):
-        return self._model.get_branching_nodes()
-
-    @deprecated(replacement="self.model.get_exit_stmt_idx")
-    def get_exit_stmt_idx(self, src_block, dst_block):
-        return self._model.get_exit_stmt_idx(src_block, dst_block)
 
     @property
     def graph(self) -> networkx.DiGraph[CFGNode]:
@@ -1203,7 +1147,8 @@ class CFGBase(Analysis):
         graph = self.graph
 
         smallest_nodes = {}  # indexed by end address of the node
-        end_addresses_to_nodes = defaultdict(set)
+        end_addr_to_node = {}  # a dictionary from node key to node *if* only one node exists for the key
+        end_addr_to_nodes = defaultdict(list)  # a dictionary from node key to nodes *if* more than one node exist
 
         for n in graph.nodes():
             if n.is_simprocedure:
@@ -1211,76 +1156,89 @@ class CFGBase(Analysis):
             end_addr = n.addr + n.size
             key = (end_addr, n.callstack_key)
             # add the new item
-            end_addresses_to_nodes[key].add(n)
+            if key not in end_addr_to_node:
+                # this is the first node of this key
+                end_addr_to_node[key] = n
+            else:
+                # this is the 2nd+ node of this key
+                if key not in end_addr_to_nodes:
+                    end_addr_to_nodes[key].append(end_addr_to_node[key])
+                end_addr_to_nodes[key].append(n)
 
-        for key in list(end_addresses_to_nodes.keys()):
-            if len(end_addresses_to_nodes[key]) == 1:
-                smallest_nodes[key] = next(iter(end_addresses_to_nodes[key]))
-                del end_addresses_to_nodes[key]
+        # update smallest_nodes
+        for key, node in end_addr_to_node.items():
+            if key in end_addr_to_nodes:
+                continue
+            smallest_nodes[key] = node
+        del end_addr_to_node  # micro memory optimization
 
-        while end_addresses_to_nodes:
+        while end_addr_to_nodes:
             key_to_find = (None, None)
-            for tpl, x in end_addresses_to_nodes.items():
-                if len(x) > 1:
-                    key_to_find = tpl
-                    break
+            for tpl in list(end_addr_to_nodes):
+                x = end_addr_to_nodes[tpl]
+                if len(x) <= 1:
+                    continue
+                key_to_find = tpl
 
-            end_addr, callstack_key = key_to_find
-            all_nodes = end_addresses_to_nodes[key_to_find]
+                end_addr, callstack_key = key_to_find
+                all_nodes = end_addr_to_nodes[key_to_find]
 
-            all_nodes = sorted(all_nodes, key=lambda node: node.addr, reverse=True)
-            smallest_node = all_nodes[0]  # take the one that has the highest address
-            other_nodes = all_nodes[1:]
+                all_nodes = sorted(all_nodes, key=lambda node: node.addr, reverse=True)
+                smallest_node = all_nodes[0]  # take the one that has the highest address
+                other_nodes = all_nodes[1:]
 
-            self._normalize_core(
-                graph, callstack_key, smallest_node, other_nodes, smallest_nodes, end_addresses_to_nodes
-            )
+                self._normalize_core(
+                    graph, callstack_key, smallest_node, other_nodes, smallest_nodes, end_addr_to_nodes
+                )
 
-            del end_addresses_to_nodes[key_to_find]
-            # make sure the smallest node is stored in end_addresses
-            smallest_nodes[key_to_find] = smallest_node
+                del end_addr_to_nodes[key_to_find]
+                # make sure the smallest node is stored in end_addresses
+                smallest_nodes[key_to_find] = smallest_node
 
-            # corner case
-            # sometimes two overlapping blocks may not be ending at the instruction. this might happen when one of the
-            # blocks (the bigger one) hits the instruction count limit or bytes limit before reaching the end address
-            # of the smaller block. in this case we manually pick up those blocks.
-            if not end_addresses_to_nodes:
-                # find if there are still overlapping blocks
-                sorted_smallest_nodes = defaultdict(list)  # callstack_key is the key of this dict
-                for k, node in smallest_nodes.items():
-                    _, callstack_key = k
-                    sorted_smallest_nodes[callstack_key].append(node)
-                for k in sorted_smallest_nodes:
-                    sorted_smallest_nodes[k] = sorted(sorted_smallest_nodes[k], key=lambda node: node.addr)
+                # corner case
+                # sometimes two overlapping blocks may not end at the instruction. this might happen when one of the
+                # blocks (the bigger one) hits the instruction count limit or bytes limit before reaching the end
+                # address of the smaller block. in this case we manually pick up those blocks.
+                if not end_addr_to_nodes:
+                    # find if there are still overlapping blocks
+                    sorted_smallest_nodes = defaultdict(list)  # callstack_key is the key of this dict
+                    for k, node in smallest_nodes.items():
+                        _, callstack_key = k
+                        sorted_smallest_nodes[callstack_key].append(node)
+                    for k in sorted_smallest_nodes:
+                        sorted_smallest_nodes[k] = sorted(sorted_smallest_nodes[k], key=lambda node: node.addr)
 
-                for callstack_key, lst in sorted_smallest_nodes.items():
-                    lst_len = len(lst)
-                    for i, node in enumerate(lst):
-                        if i == lst_len - 1:
-                            break
-                        next_node = lst[i + 1]
-                        if node is not next_node and node.addr <= next_node.addr < node.addr + node.size:
-                            # umm, those nodes are overlapping, but they must have different end addresses
-                            nodekey_a = node.addr + node.size, callstack_key
-                            nodekey_b = next_node.addr + next_node.size, callstack_key
-                            if nodekey_a == nodekey_b:
-                                # error handling: this will only happen if we have completely overlapping nodes
-                                # caused by different jumps (one of the jumps is probably incorrect), which usually
-                                # indicates an error in CFG recovery. we print a warning and skip this node
-                                l.warning(
-                                    "Found completely overlapping nodes %s. It usually indicates an error in CFG "
-                                    "recovery. Skip.",
-                                    node,
-                                )
-                                continue
+                    for callstack_key, lst in sorted_smallest_nodes.items():
+                        lst_len = len(lst)
+                        for i, node in enumerate(lst):
+                            if i == lst_len - 1:
+                                break
+                            next_node = lst[i + 1]
+                            if node is not next_node and node.addr <= next_node.addr < node.addr + node.size:
+                                # umm, those nodes are overlapping, but they must have different end addresses
+                                nodekey_a = node.addr + node.size, callstack_key
+                                nodekey_b = next_node.addr + next_node.size, callstack_key
+                                if nodekey_a == nodekey_b:
+                                    # error handling: this will only happen if we have completely overlapping nodes
+                                    # caused by different jumps (one of the jumps is probably incorrect), which usually
+                                    # indicates an error in CFG recovery. we print a warning and skip this node
+                                    l.warning(
+                                        "Found completely overlapping nodes %s. It usually indicates an error in CFG "
+                                        "recovery. Skip.",
+                                        node,
+                                    )
+                                    continue
 
-                            if nodekey_a in smallest_nodes and nodekey_b in smallest_nodes:
-                                # misuse end_addresses_to_nodes
-                                end_addresses_to_nodes[(node.addr + node.size, callstack_key)].add(node)
-                                end_addresses_to_nodes[(node.addr + node.size, callstack_key)].add(next_node)
+                                if nodekey_a in smallest_nodes and nodekey_b in smallest_nodes:
+                                    # misuse end_addresses_to_nodes
+                                    key = node.addr + node.size, callstack_key
+                                    if node not in end_addr_to_nodes[key]:
+                                        end_addr_to_nodes[key].append(node)
+                                    if next_node not in end_addr_to_nodes[key]:
+                                        end_addr_to_nodes[key].append(next_node)
 
-                            smallest_nodes.pop(nodekey_a, None)
-                            smallest_nodes.pop(nodekey_b, None)
+                                smallest_nodes.pop(nodekey_a, None)
+                                smallest_nodes.pop(nodekey_b, None)
 
         self.normalized = True
 
@@ -1291,7 +1249,7 @@ class CFGBase(Analysis):
         smallest_node,
         other_nodes,
         smallest_nodes,
-        end_addresses_to_nodes,
+        end_addr_to_nodes,
     ):
         # Break other nodes
         for n in other_nodes:
@@ -1310,8 +1268,8 @@ class CFGBase(Analysis):
             # the logic below is a little convoluted. we check if key exists in either end_address_to_nodes or
             # smallest_nodes, since we don't always add the new node back to end_addresses_to_nodes dict - we only do so
             # when there are more than one node with that key.
-            if key in end_addresses_to_nodes:
-                new_node = next((i for i in end_addresses_to_nodes[key] if i.addr == n.addr), None)
+            if key in end_addr_to_nodes:
+                new_node = next((i for i in end_addr_to_nodes[key] if i.addr == n.addr), None)
             if new_node is None and key in smallest_nodes and smallest_nodes[key].addr == n.addr:
                 new_node = smallest_nodes[key]
 
@@ -1360,8 +1318,10 @@ class CFGBase(Analysis):
 
                 # Put the new node into end_addresses list
                 if key in smallest_nodes:
-                    end_addresses_to_nodes[key].add(smallest_nodes[key])
-                    end_addresses_to_nodes[key].add(new_node)
+                    if smallest_nodes[key] not in end_addr_to_nodes[key]:
+                        end_addr_to_nodes[key].append(smallest_nodes[key])
+                    if new_node not in end_addr_to_nodes[key]:
+                        end_addr_to_nodes[key].append(new_node)
                 else:
                     smallest_nodes[key] = new_node
 
@@ -1550,10 +1510,12 @@ class CFGBase(Analysis):
                 block = next((b for b in function.blocks), None)
                 if block is None:
                     continue
-                if all(self._is_noop_insn(insn) for insn in block.capstone.insns):
+                if self._is_noop_block(self.project.arch, block) or all(
+                    self._is_noop_insn(insn) for insn in block.capstone.insns
+                ):
                     # all nops. mark this function as a function alignment
                     l.debug("Function chunk %#x is probably used as a function alignment (all nops).", func_addr)
-                    self.kb.functions[func_addr].alignment = True
+                    self.kb.functions[func_addr].is_alignment = True
                     continue
                 node = function.get_node(block.addr)
                 assert node is not None
@@ -1561,7 +1523,7 @@ class CFGBase(Analysis):
                 if len(successors) == 1 and successors[0].addr == node.addr:
                     # self loop. mark this function as a function alignment
                     l.debug("Function chunk %#x is probably used as a function alignment (self-loop).", func_addr)
-                    self.kb.functions[func_addr].alignment = True
+                    self.kb.functions[func_addr].is_alignment = True
                     continue
 
     def make_functions(self):
@@ -1569,7 +1531,7 @@ class CFGBase(Analysis):
         Revisit the entire control flow graph, create Function instances accordingly, and correctly put blocks into
         each function.
 
-        Although Function objects are crated during the CFG recovery, they are neither sound nor accurate. With a
+        Although Function objects are created during the CFG recovery, they are neither sound nor accurate. With a
         pre-constructed CFG, this method rebuilds all functions bearing the following rules:
 
             - A block may only belong to one function.
@@ -1906,7 +1868,7 @@ class CFGBase(Analysis):
             should_merge = True
             functions_to_merge = set()
             i = func_pos + 1
-            while i < len(all_func_addrs):
+            while i < len(all_func_addrs) and all_func_addrs[i] < endpoint_addr:
                 f_addr = all_func_addrs[i]
                 i += 1
                 f = functions[f_addr]
@@ -1990,10 +1952,10 @@ class CFGBase(Analysis):
                     # skip empty blocks (that are usually caused by lifting failures)
                     continue
                 block = func_0.get_block(block_node.addr, block_node.size)
-                if block.vex.jumpkind not in ("Ijk_Boring", "Ijk_InvalICache"):
-                    continue
                 # Skip alignment blocks
                 if self._is_noop_block(self.project.arch, block):
+                    continue
+                if block.vex_nostmt.jumpkind not in ("Ijk_Boring", "Ijk_InvalICache"):
                     continue
 
                 # does the first block transition to the next function?
@@ -2039,17 +2001,20 @@ class CFGBase(Analysis):
 
                 cfgnode_1_merged = False
                 # we only merge two CFG nodes if the first one does not end with a branch instruction
-                if (
-                    len(func_0.block_addrs_set) == 1
-                    and len(out_edges) == 1
-                    and out_edges[0][0].addr == cfgnode_0.addr
-                    and out_edges[0][0].size == cfgnode_0.size
-                    and self.project.factory.block(cfgnode_0.addr, strict_block_end=True).size > cfgnode_0.size
-                ):
-                    cfgnode_1_merged = True
-                    self._merge_cfgnodes(cfgnode_0, cfgnode_1)
-                    adjusted_cfgnodes.add(cfgnode_0)
-                    adjusted_cfgnodes.add(cfgnode_1)
+                if len(func_0.block_addrs_set) == 1 and len(out_edges) == 1:
+                    outedge_src, outedge_dst, outedge_data = out_edges[0]
+                    if (
+                        outedge_src.addr == cfgnode_0.addr
+                        and outedge_src.size == cfgnode_0.size
+                        and outedge_dst.addr == cfgnode_1.addr
+                        and cfgnode_0.addr + cfgnode_0.size == cfgnode_1.addr
+                        and outedge_data.get("type", None) == "transition"
+                        and outedge_data.get("stmt_idx", None) == DEFAULT_STATEMENT
+                    ):
+                        cfgnode_1_merged = True
+                        self._merge_cfgnodes(cfgnode_0, cfgnode_1)
+                        adjusted_cfgnodes.add(cfgnode_0)
+                        adjusted_cfgnodes.add(cfgnode_1)
 
                 # Merge it
                 func_1 = functions[addr_1]
@@ -2108,7 +2073,7 @@ class CFGBase(Analysis):
                 continue
             if func_addr in jumptable_entries:
                 # is there any call edge pointing to it?
-                func_node = self.get_any_node(func_addr, force_fastpath=True)
+                func_node = self.model.get_any_node(func_addr, force_fastpath=True)
                 if func_node is not None:
                     in_edges = self.graph.in_edges(func_node, data=True)
                     has_transition_pred = None
@@ -2205,10 +2170,6 @@ class CFGBase(Analysis):
             out_edges = [e for e in g.out_edges(node_) if g.get_edge_data(*e)["jumpkind"] != "Ijk_FakeRet"]
             return len(out_edges) > 1
 
-        if len(src_function.block_addrs_set) > 10:
-            # ignore functions unless they are extremely small
-            return False
-
         if len(all_edges) == 1 and dst_addr != src_addr:
             the_edge = next(iter(all_edges))
             _, dst, data = the_edge
@@ -2251,15 +2212,41 @@ class CFGBase(Analysis):
                 candidate = True
 
             if candidate:
-                regs = {self.project.arch.sp_offset}
-                if hasattr(self.project.arch, "bp_offset") and self.project.arch.bp_offset is not None:
-                    regs.add(self.project.arch.bp_offset)
-                sptracker = self.project.analyses[StackPointerTracker].prep()(
-                    src_function, regs, track_memory=self._sp_tracking_track_memory
-                )
-                sp_delta = sptracker.offset_after_block(src_addr, self.project.arch.sp_offset)
-                if sp_delta == 0:
-                    return True
+                # we have two strategies; for small functions, we run SPTracker on the entire function and see if the
+                # stack pointer changes or not; for large functions, we simply detect how far away we jump as well as
+                # if there are any other functions identified between the source and the destination.
+                if len(src_function.block_addrs_set) <= 10:
+                    regs = {self.project.arch.sp_offset}
+                    if hasattr(self.project.arch, "bp_offset") and self.project.arch.bp_offset is not None:
+                        regs.add(self.project.arch.bp_offset)
+                    sptracker = self.project.analyses[StackPointerTracker].prep()(
+                        src_function, regs, track_memory=self._sp_tracking_track_memory
+                    )
+                    sp_delta = sptracker.offset_after_block(src_addr, self.project.arch.sp_offset)
+                    if sp_delta == 0:
+                        return True
+                else:
+                    # large function; to speed things up, we don't track sp
+                    minaddr, maxaddr = None, None
+                    if dst_addr - src_addr >= 0x100:
+                        minaddr = src_addr
+                        maxaddr = dst_addr
+                    elif dst_addr < src_addr:
+                        # jumping back; is it jumping beyond the function header?
+                        src_func = blockaddr_to_function[src_addr]
+                        if dst_addr < src_func.addr and src_func.addr - dst_addr >= 0x100:
+                            minaddr = dst_addr
+                            maxaddr = src_func.addr
+
+                    if minaddr is not None and maxaddr is not None:
+                        # are there other function in between?
+                        funcaddrs_in_between = list(
+                            known_functions._function_map.irange(minimum=minaddr + 1, maximum=maxaddr - 1)
+                        )
+                        funcs_in_between = [known_functions.get_by_addr(a) for a in funcaddrs_in_between]
+                        funcs_in_between = [func for func in funcs_in_between if not func.is_alignment]
+                        if len(funcs_in_between) >= 3:
+                            return True
 
         return False
 
@@ -2582,7 +2569,11 @@ class CFGBase(Analysis):
         """
 
         if arch.name == "X86" or arch.name == "AMD64":
-            if set(block.bytes) == {0x90}:
+            block_bytes_set = set(block.bytes)
+            if block_bytes_set == {0x90}:
+                return True
+            if block_bytes_set == {0xCC}:
+                # technically this is not a no-op, but for our purposes we can settle for now
                 return True
         elif arch.name == "MIPS32":
             if arch.memory_endness == "Iend_BE":
@@ -2639,7 +2630,7 @@ class CFGBase(Analysis):
         :return: True if the instruction does no-op, False otherwise.
         """
 
-        insn_name = insn.insn_name()
+        insn_name = insn.mnemonic
 
         if insn_name == "nop":
             # nops

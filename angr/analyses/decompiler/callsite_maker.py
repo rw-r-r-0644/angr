@@ -1,11 +1,11 @@
 from __future__ import annotations
-from typing import Any, TYPE_CHECKING
+from typing import cast, Any, TYPE_CHECKING
 import copy
 import logging
 
 import archinfo
-from ailment import Stmt, Expr, Const
-from ailment.manager import Manager
+from angr.ailment import Stmt, Expr, Const
+from angr.ailment.manager import Manager
 
 from angr.procedures.stubs.format_parser import FormatParser, FormatSpecifier
 from angr.sim_type import (
@@ -14,15 +14,22 @@ from angr.sim_type import (
     SimTypeChar,
     SimTypeInt,
     SimTypeFloat,
-    dereference_simtype,
     SimTypeFunction,
     SimTypeLongLong,
 )
-from angr.calling_conventions import SimRegArg, SimStackArg, SimCC, SimStructArg, SimComboArg
+from angr.calling_conventions import (
+    SimReferenceArgument,
+    SimRegArg,
+    SimStackArg,
+    SimCC,
+    SimStructArg,
+    SimComboArg,
+    SimFunctionArgument,
+)
 from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE
 from angr.analyses import Analysis, register_analysis
 from angr.analyses.s_reaching_definitions import SRDAView
-from angr import SIM_LIBRARIES, SIM_TYPE_COLLECTIONS
+from angr.utils.types import dereference_simtype_by_lib
 
 if TYPE_CHECKING:
     from angr.knowledge_plugins.functions import Function
@@ -37,12 +44,14 @@ class CallSiteMaker(Analysis):
     Add calling convention, declaration, and args to a call site.
     """
 
-    def __init__(self, block, reaching_definitions=None, stack_pointer_tracker=None, ail_manager: Manager = None):
+    def __init__(
+        self, block, reaching_definitions=None, stack_pointer_tracker=None, ail_manager: Manager | None = None
+    ):
         self.block = block
 
         self._reaching_definitions = reaching_definitions
         self._stack_pointer_tracker = stack_pointer_tracker
-        self._ail_manager = ail_manager
+        self._ail_manager: Manager | None = ail_manager
 
         self.result_block = None
         self.stack_arg_offsets: set[tuple[int, int]] | None = None  # call ins addr, stack_offset
@@ -109,16 +118,8 @@ class CallSiteMaker(Analysis):
             # make sure the function prototype is resolved.
             # TODO: Cache resolved function prototypes globally
             prototype_libname = func.prototype_libname
-            type_collections = []
             if prototype_libname is not None:
-                prototype_lib = SIM_LIBRARIES[prototype_libname]
-                if prototype_lib.type_collection_names:
-                    for typelib_name in prototype_lib.type_collection_names:
-                        type_collections.append(SIM_TYPE_COLLECTIONS[typelib_name])
-            if type_collections:
-                prototype = dereference_simtype(prototype, type_collections).with_arch(  # type: ignore
-                    self.project.arch
-                )
+                prototype = cast(SimTypeFunction, dereference_simtype_by_lib(prototype, prototype_libname))
 
         args = []
         arg_vvars = []
@@ -144,17 +145,19 @@ class CallSiteMaker(Analysis):
                         arg_locs = cc.arg_locs(callsite_ty)
 
         if arg_locs is not None and cc is not None:
-            expanded_arg_locs = []
-            for arg_loc in arg_locs:
-                if isinstance(arg_loc, SimComboArg):
-                    # a ComboArg spans across multiple locations (mostly stack but *in theory* can also be spanning
-                    # across registers). most importantly, a ComboArg represents one variable, not multiple, but we
-                    # have no way to know that until later down the pipeline.
-                    expanded_arg_locs += arg_loc.locations
-                else:
-                    expanded_arg_locs.append(arg_loc)
-
+            expanded_arg_locs = self._expand_arglocs(arg_locs)
             for arg_loc in expanded_arg_locs:
+                if isinstance(arg_loc, SimReferenceArgument):
+                    if not isinstance(arg_loc.ptr_loc, (SimRegArg, SimStackArg)):
+                        raise NotImplementedError("Why would a calling convention produce this?")
+                    if isinstance(arg_loc.main_loc, SimStructArg):
+                        dereference_size = arg_loc.main_loc.struct.size // self.project.arch.byte_width
+                    else:
+                        dereference_size = arg_loc.main_loc.size
+                    arg_loc = arg_loc.ptr_loc
+                else:
+                    dereference_size = None
+
                 if isinstance(arg_loc, SimRegArg):
                     size = arg_loc.size
                     offset = arg_loc.check_offset(cc.arch)
@@ -182,12 +185,15 @@ class CallSiteMaker(Analysis):
                         if vvar_def_reg_offset is not None and offset > vvar_def_reg_offset:
                             # we need to shift the value
                             vvar_use = Expr.BinaryOp(
-                                self._ail_manager.next_atom(),
+                                self._ail_manager.next_atom() if self._ail_manager is not None else None,
                                 "Shr",
                                 [
                                     vvar_use,
                                     Expr.Const(
-                                        self._ail_manager.next_atom(), None, (offset - vvar_def_reg_offset) * 8, 8
+                                        self._ail_manager.next_atom() if self._ail_manager is not None else None,
+                                        None,
+                                        (offset - vvar_def_reg_offset) * 8,
+                                        8,
                                     ),
                                 ],
                                 **vvar_use.tags,
@@ -195,14 +201,14 @@ class CallSiteMaker(Analysis):
                         if vvar_def.size > arg_loc.size:
                             # we need to narrow the value
                             vvar_use = Expr.Convert(
-                                self._ail_manager.next_atom(),
+                                self._ail_manager.next_atom() if self._ail_manager is not None else None,
                                 vvar_use.bits,
                                 arg_loc.size * self.project.arch.byte_width,
                                 False,
                                 vvar_use,
                                 **vvar_use.tags,
                             )
-                        args.append(vvar_use)
+                        arg_expr = vvar_use
                     else:
                         reg = Expr.Register(
                             self._atom_idx(),
@@ -212,20 +218,17 @@ class CallSiteMaker(Analysis):
                             reg_name=arg_loc.reg_name,
                             ins_addr=last_stmt.ins_addr,
                         )
-                        args.append(reg)
+                        arg_expr = reg
                 elif isinstance(arg_loc, SimStackArg):
                     stack_arg_locs.append(arg_loc)
                     _, the_arg = self._resolve_stack_argument(call_stmt, arg_loc)
-
-                    if the_arg is not None:
-                        args.append(the_arg)
-                    else:
-                        args.append(None)
-                elif isinstance(arg_loc, SimStructArg):
-                    l.warning("SimStructArg is not yet supported")
-
+                    arg_expr = the_arg if the_arg is not None else None
                 else:
-                    raise NotImplementedError("Not implemented yet.")
+                    assert False, "Unreachable"
+
+                if arg_expr is not None and dereference_size is not None:
+                    arg_expr = Expr.Load(self._atom_idx(), arg_expr, dereference_size, endness=archinfo.Endness.BE)
+                args.append(arg_expr)
 
         # Remove the old call statement
         new_stmts = self.block.statements[:-1]
@@ -537,6 +540,29 @@ class CallSiteMaker(Analysis):
         if not specifiers:
             return None
         return len(specifiers)
+
+    def _expand_arglocs(
+        self, arg_locs: list[SimFunctionArgument]
+    ) -> list[SimStackArg | SimRegArg | SimReferenceArgument]:
+        expanded_arg_locs: list[SimStackArg | SimRegArg | SimReferenceArgument] = []
+
+        for arg_loc in arg_locs:
+            if isinstance(arg_loc, SimComboArg):
+                # a ComboArg spans across multiple locations (mostly stack but *in theory* can also be spanning
+                # across registers). most importantly, a ComboArg represents one variable, not multiple, but we
+                # have no way to know that until later down the pipeline.
+                expanded_arg_locs += arg_loc.locations
+            elif isinstance(arg_loc, SimStructArg):
+                for field_name in arg_loc.struct.fields:
+                    if field_name not in arg_loc.locs:
+                        continue
+                    expanded_arg_locs += self._expand_arglocs([arg_loc.locs[field_name]])
+            elif isinstance(arg_loc, (SimRegArg, SimStackArg, SimReferenceArgument)):
+                expanded_arg_locs.append(arg_loc)
+            else:
+                raise NotImplementedError("Not implemented yet.")
+
+        return expanded_arg_locs
 
     def _atom_idx(self) -> int | None:
         return self._ail_manager.next_atom() if self._ail_manager is not None else None

@@ -55,7 +55,7 @@ def inverted_idoms(graph: networkx.DiGraph) -> tuple[networkx.DiGraph, dict | No
 
 
 def to_acyclic_graph(
-    graph: networkx.DiGraph, ordered_nodes: list | None = None, loop_heads: list | None = None
+    graph: networkx.DiGraph, node_order: dict[Any, int] | None = None, loop_heads: list | None = None
 ) -> networkx.DiGraph:
     """
     Convert a given DiGraph into an acyclic graph.
@@ -66,21 +66,22 @@ def to_acyclic_graph(
     :return:                The converted acyclic graph.
     """
 
-    if ordered_nodes is None:
+    if node_order is None:
         # take the quasi-topological order of the graph
         ordered_nodes = GraphUtils.quasi_topological_sort_nodes(graph, loop_heads=loop_heads)
-
-    acyclic_graph = networkx.DiGraph()
+        node_order = {n: i for i, n in enumerate(ordered_nodes)}
 
     # add each node and its edge into the graph
-    visited = set()
-    for node in ordered_nodes:
-        visited.add(node)
-        acyclic_graph.add_node(node)
-        for successor in graph.successors(node):
-            if successor not in visited:
-                acyclic_graph.add_edge(node, successor)
+    edges_to_remove = []
+    for src, dst in graph.edges():
+        src_order = node_order[src]
+        dst_order = node_order[dst]
+        if src_order >= dst_order:
+            # this is a back edge, we need to remove it
+            edges_to_remove.append((src, dst))
 
+    acyclic_graph = graph.copy()
+    acyclic_graph.remove_edges_from(edges_to_remove)
     return acyclic_graph
 
 
@@ -534,11 +535,30 @@ class Dominators:
 
     def _pd_eval(self, v):
         assert self._ancestor is not None
+        assert self._semi is not None
         assert self._label is not None
 
         if self._ancestor[v.index] is None:
             return v
-        self._pd_compress(v)
+
+        # pd_compress without recursion
+        queue = []
+        current = v
+        ancestor = self._ancestor[current.index]
+        greater_ancestor = self._ancestor[ancestor.index]
+        while greater_ancestor is not None:
+            queue.append(current)
+            current, ancestor = ancestor, greater_ancestor
+            greater_ancestor = self._ancestor[ancestor.index]
+
+        for vv in reversed(queue):
+            if (
+                self._semi[self._label[self._ancestor[vv.index].index].index].index
+                < self._semi[self._label[vv.index].index].index
+            ):
+                self._label[vv.index] = self._label[self._ancestor[vv.index].index]
+            self._ancestor[vv.index] = self._ancestor[self._ancestor[vv.index].index]
+
         return self._label[v.index]
 
     def _pd_compress(self, v):
@@ -654,6 +674,21 @@ class GraphUtils:
         return list(widening_addrs)
 
     @staticmethod
+    def dfs_postorder_nodes_deterministic(graph: networkx.DiGraph, source):
+        visited = set()
+        stack = [source]
+        while stack:
+            node = stack[-1]
+            if node not in visited:
+                visited.add(node)
+                for succ in sorted(graph.successors(node), key=GraphUtils._sort_node):
+                    if succ not in visited:
+                        stack.append(succ)
+            else:
+                yield node
+                stack.pop()
+
+    @staticmethod
     def reverse_post_order_sort_nodes(graph, nodes=None):
         """
         Sort a given set of nodes in reverse post ordering.
@@ -673,8 +708,39 @@ class GraphUtils:
         return sorted(nodes, key=lambda n: addrs_to_index[n.addr], reverse=True)
 
     @staticmethod
+    def _sort_node(node):
+        """
+        A sorter to make a deterministic order of nodes.
+        """
+        if hasattr(node, "addr"):
+            return node.addr
+        return node
+
+    @staticmethod
+    def _sort_edge(edge):
+        """
+        A sorter to make a deterministic order of edges.
+        """
+        _src, _dst = edge
+        src_addr, dst_addr = 0, 0
+        if hasattr(_src, "addr"):
+            src_addr = _src.addr
+        elif isinstance(_src, int):
+            src_addr = _src
+
+        if hasattr(_dst, "addr"):
+            dst_addr = _dst.addr
+        elif isinstance(_dst, int):
+            dst_addr = _dst
+
+        return src_addr + dst_addr
+
+    @staticmethod
     def quasi_topological_sort_nodes(
-        graph: networkx.DiGraph, nodes: list | None = None, loop_heads: list | None = None
+        graph: networkx.DiGraph,
+        nodes: list | None = None,
+        loop_heads: list | None = None,
+        panic_mode_threshold: int = 3000,
     ) -> list:
         """
         Sort a given set of nodes from a graph based on the following rules:
@@ -688,6 +754,7 @@ class GraphUtils:
         :param graph:       A local transition graph of the function.
         :param nodes:       A list of nodes to sort. None if you want to sort all nodes inside the graph.
         :param loop_heads:  A list of nodes that should be treated loop heads.
+        :param panic_mode_threshold: Threshold of nodes in an SCC to begin aggressively removing edges.
         :return:            A list of ordered nodes.
         """
 
@@ -702,32 +769,18 @@ class GraphUtils:
 
         # find all strongly connected components in the graph
         sccs = [scc for scc in networkx.strongly_connected_components(graph) if len(scc) > 1]
-
-        def _sort_edge(edge):
-            """
-            A sorter to make a deterministic order of edges.
-            """
-            _src, _dst = edge
-            src_addr, dst_addr = 0, 0
-            if hasattr(_src, "addr"):
-                src_addr = _src.addr
-            elif isinstance(_src, int):
-                src_addr = _src
-
-            if hasattr(_dst, "addr"):
-                dst_addr = _dst.addr
-            elif isinstance(_dst, int):
-                dst_addr = _dst
-
-            return src_addr + dst_addr
+        comp_indices = {}
+        for i, scc in enumerate(sccs):
+            for node in scc:
+                if node not in comp_indices:
+                    comp_indices[node] = i
 
         # collapse all strongly connected components
-        edges = sorted(graph.edges(), key=_sort_edge)
-        for src, dst in edges:
-            scc_index = GraphUtils._components_index_node(sccs, src)
+        for src, dst in sorted(graph.edges(), key=GraphUtils._sort_edge):
+            scc_index = comp_indices.get(src)
             if scc_index is not None:
                 src = SCCPlaceholder(scc_index)
-            scc_index = GraphUtils._components_index_node(sccs, dst)
+            scc_index = comp_indices.get(dst)
             if scc_index is not None:
                 dst = SCCPlaceholder(scc_index)
 
@@ -754,7 +807,13 @@ class GraphUtils:
         ordered_nodes = []
         for n in tmp_nodes:
             if isinstance(n, SCCPlaceholder):
-                GraphUtils._append_scc(graph, ordered_nodes, sccs[n.scc_id], loop_head_candidates=loop_heads)
+                GraphUtils._append_scc(
+                    graph,
+                    ordered_nodes,
+                    sccs[n.scc_id],
+                    loop_head_candidates=loop_heads,
+                    panic_mode_threshold=panic_mode_threshold,
+                )
             else:
                 ordered_nodes.append(n)
 
@@ -763,15 +822,12 @@ class GraphUtils:
         return [n for n in ordered_nodes if n in set(nodes)]
 
     @staticmethod
-    def _components_index_node(components, node):
-        for i, comp in enumerate(components):
-            if node in comp:
-                return i
-        return None
-
-    @staticmethod
     def _append_scc(
-        graph: networkx.DiGraph, ordered_nodes: list, scc: set, loop_head_candidates: list | None = None
+        graph: networkx.DiGraph,
+        ordered_nodes: list,
+        scc: set,
+        loop_head_candidates: list | None = None,
+        panic_mode_threshold: int = 3000,
     ) -> None:
         """
         Append all nodes from a strongly connected component to a list of ordered nodes and ensure the topological
@@ -780,15 +836,16 @@ class GraphUtils:
         :param graph: The graph where all nodes belong to.
         :param ordered_nodes:     Ordered nodes.
         :param scc:           A set of nodes that forms a strongly connected component in the graph.
+        :param panic_mode_threshold: Threshold of nodes in an SCC to begin aggressively removing edges.
         """
 
         loop_head = None
 
         if loop_head_candidates is not None:
             # find the first node that appears in loop_heads
-            loop_head_candidates = set(loop_head_candidates)
+            loop_head_candidates_set = set(loop_head_candidates)
             for n in scc:
-                if n in loop_head_candidates:
+                if n in loop_head_candidates_set:
                     loop_head = n
                     break
 
@@ -817,10 +874,10 @@ class GraphUtils:
                     break
 
         if loop_head is None:
-            # randomly pick one
-            loop_head = next(iter(scc))
+            # pick the first one
+            loop_head = sorted(scc, key=GraphUtils._sort_node)[0]
 
-        subgraph: networkx.DiGraph = graph.subgraph(scc).copy()
+        subgraph: networkx.DiGraph = graph.subgraph(scc).copy()  # type: ignore
         for src, _ in list(subgraph.in_edges(loop_head)):
             subgraph.remove_edge(src, loop_head)
 
@@ -828,8 +885,8 @@ class GraphUtils:
         # will take too long to converge if we only remove one node out of the component each time. we introduce a
         # panic mode that will aggressively remove edges
 
-        if len(subgraph) > 3000 and len(subgraph.edges) > len(subgraph) * 1.4:
-            for n0, n1 in sorted(dfs_back_edges(subgraph, loop_head), key=lambda x: (x[0].addr, x[0].addr)):
+        if len(subgraph) > panic_mode_threshold and len(subgraph.edges) > len(subgraph) * 1.4:
+            for n0, n1 in sorted(dfs_back_edges(subgraph, loop_head), key=GraphUtils._sort_edge):
                 subgraph.remove_edge(n0, n1)
                 if len(subgraph.edges) <= len(subgraph) * 1.4:
                     break

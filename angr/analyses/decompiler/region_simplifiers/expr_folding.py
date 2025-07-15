@@ -4,10 +4,10 @@ from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING
 
-import ailment
-from ailment import Expression, Block, AILBlockWalker
-from ailment.expression import ITE, Load
-from ailment.statement import Statement, Assignment, Call, Return
+from angr import ailment
+from angr.ailment import Expression, Block, AILBlockWalker
+from angr.ailment.expression import ITE, Load
+from angr.ailment.statement import Statement, Assignment, Call, Return
 
 from angr.utils.ail import is_phi_assignment
 from angr.utils.ssa import VVarUsesCollector
@@ -17,11 +17,12 @@ from angr.analyses.decompiler.structuring.structurer_nodes import (
     ConditionalBreakNode,
     LoopNode,
     CascadingConditionNode,
+    SequenceNode,
     SwitchCaseNode,
 )
 
 if TYPE_CHECKING:
-    from ailment.expression import MultiStatementExpression
+    from angr.ailment.expression import MultiStatementExpression
 
 
 class LocationBase:
@@ -154,6 +155,26 @@ class ConditionalBreakLocation(LocationBase):
 
     def __eq__(self, other):
         return isinstance(other, ConditionalBreakLocation) and self.node_addr == other.node_addr
+
+
+class LoopNodeFinder(SequenceWalker):
+    """
+    Returns all loops in a given region.
+    """
+
+    def __init__(self, node: SequenceNode):
+        handlers = {
+            LoopNode: self._handle_Loop,
+        }
+        super().__init__(handlers, update_seqnode_in_place=False, force_forward_scan=True)
+        self.loop_nodes: list[LoopNode] = []
+
+        self.walk(node)
+
+    def _handle_Loop(self, node: LoopNode, **kwargs):
+        super()._handle_Loop(node, **kwargs)
+        self.loop_nodes.append(node)
+        return None
 
 
 class MultiStatementExpressionAssignmentFinder(AILBlockWalker):
@@ -345,7 +366,8 @@ class ExpressionCounter(SequenceWalker):
         if node.condition is not None:
             self._collect_assignments(node.condition, node)
             self._collect_uses(node.condition, ConditionLocation(node.addr))
-        return super()._handle_Loop(node, **kwargs)
+        # we do not go ahead and collect into the loop body
+        return None
 
     def _handle_SwitchCase(self, node: SwitchCaseNode, **kwargs):
         self._collect_uses(node.switch_expr, ConditionLocation(node.addr))
@@ -419,11 +441,16 @@ class InterferenceChecker(SequenceWalker):
             # special case: we process the call arguments first, then the call itself. this is to allow more expression
             # folding opportunities.
             the_call = None
-            if isinstance(stmt, Assignment) and isinstance(stmt.src, ailment.Stmt.Call):
+            if (
+                isinstance(stmt, Assignment)
+                and isinstance(stmt.src, ailment.Stmt.Call)
+                and not isinstance(stmt.src.target, str)
+            ):
                 the_call = stmt.src
             elif isinstance(stmt, ailment.Stmt.Call) and not isinstance(stmt.target, str):
                 the_call = stmt
             if the_call is not None:
+                assert isinstance(the_call.target, ailment.Stmt.Expression)
                 spotter.walk_expression(the_call.target)
                 if the_call.args:
                     for arg in the_call.args:
@@ -614,6 +641,7 @@ class ExpressionFolder(SequenceWalker):
             ConditionNode: self._handle_Condition,
             ConditionalBreakNode: self._handle_ConditionalBreak,
             SwitchCaseNode: self._handle_SwitchCase,
+            LoopNode: self._handle_Loop,
         }
 
         super().__init__(handlers)
@@ -693,7 +721,8 @@ class ExpressionFolder(SequenceWalker):
             if r is not None and r is not node.condition:
                 node.condition = r
 
-        return super()._handle_Loop(node, **kwargs)
+        # again, do not replace into the loop body
+        return None
 
     def _handle_SwitchCase(self, node: SwitchCaseNode, **kwargs):
         replacer = ExpressionReplacer(self._assignments, self._uses)

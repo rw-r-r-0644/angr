@@ -1,10 +1,22 @@
-# pylint:disable=unused-argument,no-self-use
+# pylint:disable=unused-argument,no-self-use,too-many-boolean-expressions
 from __future__ import annotations
+from typing import TYPE_CHECKING
 import logging
 
-from ailment.block import Block
-from ailment.statement import Statement, Assignment, Store, Call, Return, ConditionalJump, DirtyStatement
-from ailment.expression import (
+from angr.ailment.block import Block
+from angr.ailment.statement import (
+    Statement,
+    Assignment,
+    Store,
+    Call,
+    CAS,
+    Return,
+    ConditionalJump,
+    DirtyStatement,
+    WeakAssignment,
+)
+from angr.ailment.expression import (
+    Atom,
     Expression,
     VirtualVariable,
     Load,
@@ -17,8 +29,10 @@ from ailment.expression import (
     DirtyExpression,
     Reinterpret,
 )
-
 from angr.engines.light import SimEngineNostmtAIL
+
+if TYPE_CHECKING:
+    from angr import KnowledgeBase
 
 
 _l = logging.getLogger(__name__)
@@ -36,11 +50,15 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
         self,
         project,
         vvar_to_vvar: dict[int, int],
+        func_addr: int | None = None,
+        variable_kb: KnowledgeBase | None = None,
     ):
         super().__init__(project)
 
         self.vvar_to_vvar = vvar_to_vvar
         self.out_block = None
+        self.func_addr = func_addr
+        self.variable_kb = variable_kb
 
         self._stmt_handlers["IncompleteSwitchCaseHeadStatement"] = self._handle_stmt_IncompleteSwitchCaseHeadStatement
 
@@ -88,15 +106,78 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
                 **stmt.dst.tags,
             )
 
-        if new_dst is not None or new_src is not None:
-            # ensure we do not generate vvar_A = vvar_A
-            dst = stmt.dst if new_dst is None else new_dst
-            src = stmt.src if new_src is None else new_src
-            if isinstance(dst, VirtualVariable) and isinstance(src, VirtualVariable) and dst.varid == src.varid:
+        # ensure we do not generate vvar_A = vvar_A or var_A = var_A (even if lhs and rhs are different vvars, they
+        # can be mapped to the same variable)
+        dst = stmt.dst if new_dst is None else new_dst
+        src = stmt.src if new_src is None else new_src
+        if isinstance(dst, VirtualVariable) and isinstance(src, VirtualVariable):
+            if dst.varid == src.varid:
                 # skip it
                 return ()
+            if (
+                self.func_addr is not None
+                and self.variable_kb is not None
+                and self.func_addr in self.variable_kb.variables
+            ):
+                dst_var = getattr(dst, "variable", None)
+                src_var = getattr(src, "variable", None)
+                var_manager = self.variable_kb.variables[self.func_addr]
+                if (
+                    dst_var is not None
+                    and src_var is not None
+                    and var_manager.unified_variable(dst_var) is var_manager.unified_variable(src_var)
+                ):
+                    # skip it
+                    return ()
 
             return Assignment(stmt.idx, dst, src, **stmt.tags)
+        return None
+
+    def _handle_stmt_WeakAssignment(self, stmt) -> WeakAssignment | None:
+        new_src = self._expr(stmt.src)
+        new_dst = self._expr(stmt.dst)
+
+        if new_dst is not None or new_src is not None:
+            return WeakAssignment(
+                stmt.idx,
+                stmt.dst if new_dst is None else new_dst,  # type: ignore
+                stmt.src if new_src is None else new_src,
+                **stmt.tags,
+            )
+        return None
+
+    def _handle_stmt_CAS(self, stmt: CAS) -> CAS | None:
+        new_addr = self._expr(stmt.addr)
+        new_data_lo = self._expr(stmt.data_lo)
+        new_data_hi = self._expr(stmt.data_hi) if stmt.data_hi is not None else None
+        new_expd_lo = self._expr(stmt.expd_lo)
+        new_expd_hi = self._expr(stmt.expd_hi) if stmt.expd_hi is not None else None
+        new_old_lo = self._expr(stmt.old_lo)
+        new_old_hi = self._expr(stmt.old_hi) if stmt.old_hi is not None else None
+        assert new_old_lo is None or isinstance(new_old_lo, Atom)
+        assert new_old_hi is None or isinstance(new_old_hi, Atom)
+
+        if (
+            new_addr is not None
+            or new_old_lo is not None
+            or new_old_hi is not None
+            or new_data_lo is not None
+            or new_data_hi is not None
+            or new_expd_lo is not None
+            or new_expd_hi is not None
+        ):
+            return CAS(
+                stmt.idx,
+                stmt.addr if new_addr is None else new_addr,
+                stmt.data_lo if new_data_lo is None else new_data_lo,
+                stmt.data_hi if new_data_hi is None else new_data_hi,
+                stmt.expd_lo if new_expd_lo is None else new_expd_lo,
+                stmt.expd_hi if new_expd_hi is None else new_expd_hi,
+                stmt.old_lo if new_old_lo is None else new_old_lo,
+                stmt.old_hi if new_old_hi is None else new_old_hi,
+                stmt.endness,
+                **stmt.tags,
+            )
         return None
 
     def _handle_stmt_Store(self, stmt):
@@ -157,6 +238,7 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
         dirty = self._expr(stmt.dirty)
         if dirty is None or dirty is stmt.dirty:
             return None
+        assert isinstance(dirty, DirtyExpression)
         return DirtyStatement(stmt.idx, dirty, **stmt.tags)
 
     def _handle_expr_Load(self, expr):
@@ -299,7 +381,7 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
             return VEXCCallExpression(
                 expr.idx,
                 expr.callee,
-                new_operands,
+                tuple(new_operands),
                 bits=expr.bits,
                 **expr.tags,
             )

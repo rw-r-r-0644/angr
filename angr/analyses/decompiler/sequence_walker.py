@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections import OrderedDict
 
-import ailment
+import angr.ailment as ailment
 
 from angr.errors import UnsupportedNodeTypeError
 from .structuring.structurer_nodes import (
@@ -180,7 +180,7 @@ class SequenceWalker:
 
         return None
 
-    def _handle_Loop(self, node: LoopNode, **kwargs):
+    def _handle_Loop(self, node: LoopNode, **kwargs) -> LoopNode | None:
         new_initializer = self._handle(node.initializer) if node.initializer is not None else None
         new_iterator = self._handle(node.iterator) if node.iterator is not None else None
         new_condition = (

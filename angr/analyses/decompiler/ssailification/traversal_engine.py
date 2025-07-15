@@ -1,8 +1,17 @@
 from __future__ import annotations
 from collections import OrderedDict
 
-from ailment.statement import Call, Store, ConditionalJump
-from ailment.expression import Register, BinaryOp, StackBaseOffset, ITE, VEXCCallExpression, Tmp, DirtyExpression, Load
+from angr.ailment.statement import Call, Store, ConditionalJump, CAS
+from angr.ailment.expression import (
+    Register,
+    BinaryOp,
+    StackBaseOffset,
+    ITE,
+    VEXCCallExpression,
+    Tmp,
+    DirtyExpression,
+    Load,
+)
 
 from angr.engines.light import SimEngineLightAIL
 from angr.project import Project
@@ -59,6 +68,19 @@ class SimEngineSSATraversal(SimEngineLightAIL[TraversalState, None, None, None])
             self.state.live_registers.add(base_off)
 
         self._expr(stmt.src)
+
+    def _handle_stmt_WeakAssignment(self, stmt):
+        self._expr(stmt.src)
+        self._expr(stmt.dst)
+
+    def _handle_stmt_CAS(self, stmt: CAS):
+        self._expr(stmt.addr)
+        self._expr(stmt.data_lo)
+        if stmt.data_hi is not None:
+            self._expr(stmt.data_hi)
+        self._expr(stmt.expd_lo)
+        if stmt.expd_hi is not None:
+            self._expr(stmt.expd_hi)
 
     def _handle_stmt_Store(self, stmt: Store):
         self._expr(stmt.addr)
@@ -148,6 +170,17 @@ class SimEngineSSATraversal(SimEngineLightAIL[TraversalState, None, None, None])
                 self.loc_to_defs[codeloc] = OrderedSet()
             self.loc_to_defs[codeloc].add(expr)
             self.state.live_stackvars.add((expr.addr.offset, expr.size))
+
+    def _handle_expr_StackBaseOffset(self, expr: StackBaseOffset):
+        # we don't know the size, so we assume the size is 1 for now...
+        sz = 1
+        if isinstance(expr.offset, int) and (expr.offset, sz) not in self.state.live_stackvars:
+            codeloc = self._codeloc()
+            self.def_to_loc.append((expr, codeloc))
+            if codeloc not in self.loc_to_defs:
+                self.loc_to_defs[codeloc] = OrderedSet()
+            self.loc_to_defs[codeloc].add(expr)
+            self.state.live_stackvars.add((expr.offset, sz))
 
     def _handle_expr_Tmp(self, expr: Tmp):
         if self.use_tmps:
@@ -269,6 +302,5 @@ class SimEngineSSATraversal(SimEngineLightAIL[TraversalState, None, None, None])
     _handle_expr_Phi = _handle_Dummy
     _handle_expr_Const = _handle_Dummy
     _handle_expr_MultiStatementExpression = _handle_Dummy
-    _handle_expr_StackBaseOffset = _handle_Dummy
     _handle_expr_BasePointerOffset = _handle_Dummy
     _handle_expr_Call = _handle_Dummy

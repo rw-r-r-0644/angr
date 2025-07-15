@@ -4,9 +4,9 @@ from collections import defaultdict
 
 import networkx
 
-from ailment import AILBlockWalker, Block
-from ailment.statement import ConditionalJump, Statement, Assignment
-from ailment.expression import Const, BinaryOp, VirtualVariable
+from angr.ailment import AILBlockWalker, Block
+from angr.ailment.statement import ConditionalJump, Statement, Assignment
+from angr.ailment.expression import Const, BinaryOp, VirtualVariable
 
 from angr.analyses.decompiler.utils import first_nonlabel_nonphi_statement
 from angr.utils.graph import dominates
@@ -106,6 +106,12 @@ class ConditionConstantPropagation(OptimizationPass):
             if src not in cconds_by_src:
                 cconds_by_src[src] = []
             cconds_by_src[src].append(ccond)
+
+        # eliminate sources with more than one in-edges; this is because the condition may not hold on all in-edges!
+        for src in list(cconds_by_src):
+            block = self._get_block(src[0], idx=src[1])
+            if block is not None and block in self._graph and self._graph.in_degree[block] > 1:
+                del cconds_by_src[src]
 
         # eliminate conflicting conditions
         for src in list(cconds_by_src):

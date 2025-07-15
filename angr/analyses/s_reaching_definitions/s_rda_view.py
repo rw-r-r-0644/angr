@@ -4,9 +4,9 @@ import logging
 from collections.abc import Callable
 from collections import defaultdict
 
-from ailment import Block
-from ailment.statement import Statement, Assignment, Call, Label
-from ailment.expression import VirtualVariable, VirtualVariableCategory, Expression
+from angr.ailment import Block
+from angr.ailment.statement import Statement, Assignment, Call, Label
+from angr.ailment.expression import VirtualVariable, VirtualVariableCategory, Expression
 
 from angr.utils.ail import is_phi_assignment
 from angr.utils.graph import GraphUtils
@@ -37,7 +37,8 @@ class RegVVarPredicate:
         if cc is not None:
             reg_list = cc.CALLER_SAVED_REGS
             if isinstance(cc.RETURN_VAL, SimRegArg):
-                reg_list.append(cc.RETURN_VAL.reg_name)
+                # do not update reg_list directly, otherwise you may update cc.CALLER_SAVED_REGS!
+                reg_list = [*reg_list, cc.RETURN_VAL.reg_name]
             return {self.arch.registers[reg_name][0] for reg_name in reg_list}
         log.warning("Cannot determine registers that are clobbered by call statement %r.", stmt)
         return set()
@@ -130,6 +131,7 @@ class SRDAView:
 
             for stmt in reversed(stmts):
                 r = predicate(stmt)
+                predicate_returned_true |= r
                 should_break = (predicate_returned_true and r is False) if consecutive else r
                 if should_break:
                     break

@@ -271,6 +271,13 @@ class GraphRegion:
         else:
             replace_with_graph_with_successors = replace_with.graph_with_successors
 
+        # if complete_successors is True for RegionIdentifier, replace_with.graph_with_successors may include nodes
+        # and edges that are *only* reachable from immediate successors. we will want to remove these nodes and edges,
+        # otherwise we may end up structuring the same region twice!
+        replace_with_graph_with_successors = self._cleanup_graph_with_successors(
+            replace_with.graph, replace_with_graph_with_successors
+        )
+
         self._replace_node_in_graph_with_subgraph(
             self.graph,
             self.successors,
@@ -288,6 +295,18 @@ class GraphRegion:
                 replace_with_graph_with_successors,
                 replace_with.head,
             )
+
+    @staticmethod
+    def _cleanup_graph_with_successors(
+        graph: networkx.DiGraph, graph_with_successors: networkx.DiGraph
+    ) -> networkx.DiGraph:
+        expected_nodes = set(graph)
+        for n in list(expected_nodes):
+            for succ in graph_with_successors.successors(n):
+                expected_nodes.add(succ)
+        if all(n in expected_nodes for n in graph_with_successors):
+            return graph_with_successors
+        return graph_with_successors.subgraph(expected_nodes).to_directed()
 
     @staticmethod
     def _replace_node_in_graph(graph: networkx.DiGraph, node, replace_with, removed_edges: set):
@@ -324,6 +343,15 @@ class GraphRegion:
         out_edges = list(graph.out_edges(node))
 
         graph.remove_node(node)
+
+        # FIXME: this is a giant hack to work around the problem that the graph region might have been restructured
+        # but not updated in *all* other regions whose .graph_with_successors references this graph region (we only
+        # update the parent_region graph right now).
+        existing_graph_regions: dict[int, GraphRegion] = {r.addr: r for r in graph if isinstance(r, GraphRegion)}
+        for r in sub_graph:
+            if isinstance(r, GraphRegion) and r not in graph and r.addr in existing_graph_regions:
+                self._replaced_regions[r] = existing_graph_regions[r.addr]
+
         sub_graph_nodes = [self._replaced_regions.get(nn, nn) for nn in sub_graph.nodes]
         sub_graph_edges = [
             (self._replaced_regions.get(src, src), self._replaced_regions.get(dst, dst)) for src, dst in sub_graph.edges
@@ -376,11 +404,11 @@ class GraphRegion:
             else:
                 if dst_in_subgraph in sub_graph:
                     for src in sub_graph.predecessors(dst_in_subgraph):
-                        graph.add_edge(src, dst)
+                        graph.add_edge(self._replaced_regions.get(src, src), dst)
                 elif reference_full_graph is not None and dst_in_subgraph in reference_full_graph:
                     for src in reference_full_graph.predecessors(dst_in_subgraph):
                         if src in graph:
-                            graph.add_edge(src, dst)
+                            graph.add_edge(self._replaced_regions.get(src, src), dst)
                 else:
                     # it may happen that the dst node no longer exists in sub_graph or its successors
                     # this is because we have deemed that the dst node is no longer a valid successor for sub_graph

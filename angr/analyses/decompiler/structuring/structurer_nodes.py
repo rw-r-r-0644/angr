@@ -4,8 +4,7 @@ from typing import Any
 from collections import OrderedDict
 
 import claripy
-import ailment
-import ailment.utils
+import angr.ailment as ailment
 
 
 INDENT_DELTA = 2
@@ -234,7 +233,7 @@ class CascadingConditionNode(BaseNode):
         self,
         addr,
         condition_and_nodes: list[tuple[Any, BaseNode | ailment.Block | MultiNode]],
-        else_node: BaseNode = None,
+        else_node: BaseNode | None = None,
     ):
         self.addr = addr
         self.condition_and_nodes = condition_and_nodes
@@ -368,6 +367,17 @@ class SwitchCaseNode(BaseNode):
         self.default_node = default_node
         self.addr = addr
 
+    def dbg_repr(self, indent=0) -> str:
+        return (
+            f"SwitchCaseNode(switch_expr={self.switch_expr}, cases=["
+            + ", ".join(
+                hex(case) if isinstance(case, int) else f"({', '.join(hex(ccase) for ccase in case)})"
+                for case in self.cases
+            )
+            + "\n"
+            + f"], default_node={self.default_node})"
+        )
+
 
 class IncompleteSwitchCaseNode(BaseNode):
     """
@@ -381,6 +391,9 @@ class IncompleteSwitchCaseNode(BaseNode):
         self.addr = addr
         self.head = head
         self.cases: list = cases
+
+    def __repr__(self):
+        return f"<IncompleteSwitchCase {self.addr:#x} with {len(self.cases)} cases>"
 
 
 #

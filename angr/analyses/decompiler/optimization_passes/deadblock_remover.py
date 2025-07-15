@@ -6,8 +6,8 @@ import networkx
 
 import claripy
 
-from ailment.statement import Jump
-from ailment.expression import Const
+from angr.ailment.statement import Jump
+from angr.ailment.expression import Const
 from angr.utils.graph import to_acyclic_graph
 from angr.analyses.decompiler.condition_processor import ConditionProcessor
 from .optimization_pass import OptimizationPass, OptimizationPassStage
@@ -60,7 +60,7 @@ class DeadblockRemover(OptimizationPass):
             blk
             for blk in self._graph.nodes()
             if (blk.addr != self._func.addr and self._graph.in_degree(blk) == 0)
-            or claripy.is_false(cond_proc.reaching_conditions[blk])
+            or claripy.is_false(cond_proc.reaching_conditions.get(blk, claripy.true()))
         }
 
         # fix up predecessors

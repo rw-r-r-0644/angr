@@ -188,6 +188,16 @@ class TestVex(unittest.TestCase):
         assert s.solver.is_true(cf == 0)
         assert s.solver.is_true(of == 1)
 
+    def test_aarch64_ccall_symbolic_op(self):
+        # GitHub issue #5460
+
+        # CCMP            W9, W8, #4, NE
+        proj = load_shellcode(b"\x24\x11\x48\x7a", arch="arm64")
+        state = proj.factory.blank_state()
+        state.regs.w8 = 0xE0
+        successors = state.step()
+        assert len(successors.flat_successors) == 1  # we are good as long as it does not raise any exceptions
+
     def test_aarch64_32bit_ccalls(self):
         # GitHub issue #1238
         s = SimState(arch="AArch64")
@@ -575,6 +585,44 @@ class TestVex(unittest.TestCase):
         target_func = claripy.If((x & (x - 1)) == 0, claripy.BVV(0, 64), 1)
         solver = claripy.Solver()
         solver.add(sm.one_deadended.regs.rax != target_func)
+        assert not solver.satisfiable()
+
+    def test_cmpltsd(self):
+        p = load_shellcode(bytes.fromhex("f20fc2c101c3"), arch="amd64")
+        # 0000000000000000 F20FC2C101                      CMPLTSD XMM0,XMM1
+        # 0000000000000005 C3                              RET
+        x = claripy.BVS("x", 64)
+        x_fp = claripy.fpToFP(x, claripy.FSORT_DOUBLE)
+        y = claripy.BVS("y", 64)
+        y_fp = claripy.fpToFP(y, claripy.FSORT_DOUBLE)
+        s = p.factory.call_state(0)
+        s.regs.xmm0lq = x
+        s.regs.xmm1lq = y
+        sm = p.factory.simulation_manager(s)
+        sm.run()
+
+        target_func = claripy.If(x_fp < y_fp, claripy.BVV(-1, 64), claripy.BVV(0, 64))
+        solver = claripy.Solver()
+        solver.add(sm.one_deadended.regs.xmm0lq != target_func)
+        assert not solver.satisfiable()
+
+    def test_cmplesd(self):
+        p = load_shellcode(bytes.fromhex("f20fc2c102c3"), arch="amd64")
+        # 0000000000000000 F20FC2C102                      CMPLESD XMM0,XMM1
+        # 0000000000000005 C3                              RET
+        x = claripy.BVS("x", 64)
+        x_fp = claripy.fpToFP(x, claripy.FSORT_DOUBLE)
+        y = claripy.BVS("y", 64)
+        y_fp = claripy.fpToFP(y, claripy.FSORT_DOUBLE)
+        s = p.factory.call_state(0)
+        s.regs.xmm0lq = x
+        s.regs.xmm1lq = y
+        sm = p.factory.simulation_manager(s)
+        sm.run()
+
+        target_func = claripy.If(x_fp <= y_fp, claripy.BVV(-1, 64), claripy.BVV(0, 64))
+        solver = claripy.Solver()
+        solver.add(sm.one_deadended.regs.xmm0lq != target_func)
         assert not solver.satisfiable()
 
 

@@ -3,8 +3,6 @@ import itertools
 from typing import TYPE_CHECKING
 import logging
 
-import networkx
-
 from angr.analyses import Analysis, register_analysis
 from angr.analyses.decompiler.condition_processor import ConditionProcessor
 from angr.analyses.decompiler.graph_region import GraphRegion
@@ -12,6 +10,7 @@ from angr.analyses.decompiler.jumptable_entry_condition_rewriter import JumpTabl
 from angr.analyses.decompiler.empty_node_remover import EmptyNodeRemover
 from angr.analyses.decompiler.jump_target_collector import JumpTargetCollector
 from angr.analyses.decompiler.redundant_label_remover import RedundantLabelRemover
+from angr.utils.graph import GraphUtils
 from .structurer_nodes import BaseNode
 from .structurer_base import StructurerBase
 from .dream import DreamStructurer
@@ -43,7 +42,7 @@ class RecursiveStructurer(Analysis):
         self.structurer_cls = structurer_cls if structurer_cls is not None else DreamStructurer
         self.structurer_options = kwargs
 
-        self.result = None
+        self.result: BaseNode | None = None
         self.result_incomplete: bool = False
 
         self._analyze()
@@ -61,7 +60,7 @@ class RecursiveStructurer(Analysis):
             current_region = stack[-1]
 
             has_region = False
-            for node in networkx.dfs_postorder_nodes(current_region.graph, current_region.head):
+            for node in GraphUtils.dfs_postorder_nodes_deterministic(current_region.graph, current_region.head):
                 subnodes = []
                 if type(node) is GraphRegion:
                     if node.cyclic:
@@ -161,6 +160,7 @@ class RecursiveStructurer(Analysis):
         for jump_table_head_addr, jumptable in jump_tables.items():
             if jump_table_head_addr not in func_block_addrs:
                 continue
+            assert jumptable.jumptable_entries is not None
             for entry_addr in jumptable.jumptable_entries:
                 entries[entry_addr] = jump_table_head_addr
 
@@ -176,9 +176,9 @@ class RecursiveStructurer(Analysis):
         for node in region.graph.nodes:
             if not isinstance(node, BaseNode):
                 continue
-            if node.addr == self.function.addr:
+            if self.function is not None and node.addr == self.function.addr:
                 return node
-            if min_node is None or min_node.addr < node.addr:
+            if min_node is None or (min_node.addr is not None and node.addr is not None and min_node.addr < node.addr):
                 min_node = node
 
         return min_node

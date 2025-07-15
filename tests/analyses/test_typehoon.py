@@ -16,9 +16,10 @@ from angr.analyses.typehoon.typevars import (
     FuncIn,
     FuncOut,
     Load,
+    Store,
     HasField,
 )
-from angr.analyses.typehoon.typeconsts import Int32, Struct, Pointer64, Float32
+from angr.analyses.typehoon.typeconsts import Int32, Struct, Pointer64, Float32, Float64
 from angr.analyses.typehoon.translator import TypeTranslator
 
 from tests.common import bin_location
@@ -59,6 +60,7 @@ class TestTypehoon(unittest.TestCase):
         proj.analyses.CompleteCallingConventions()
 
         dec = proj.analyses.Decompiler(main_func)
+        assert dec.codegen is not None and dec.codegen.text is not None
         assert "->field_0 = 10;" in dec.codegen.text
         assert "->field_4 = 20;" in dec.codegen.text
         assert "->field_8 = 808464432;" in dec.codegen.text
@@ -73,6 +75,7 @@ class TestTypehoon(unittest.TestCase):
         proj.analyses.CompleteCallingConventions()
 
         dec = proj.analyses.Decompiler(main_func, cfg=cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
         assert dec.codegen.text.count("UNICODE_STRING v") == 2
 
     def test_type_inference_basic_case_0(self):
@@ -117,6 +120,67 @@ class TestTypehoon(unittest.TestCase):
         assert isinstance(t0_solution.basetype.fields[0], Pointer64)
         assert t0_solution.basetype.fields[0].basetype is t0_solution.basetype
         assert isinstance(t0_solution.basetype.fields[4], Int32)
+
+    def test_type_inference_transitive(self):
+        # a <: b <: c ==> a <: c
+        func_f = TypeVariable(name="F")
+        t0 = TypeVariable(name="T0")
+        t1 = TypeVariable(name="T1")
+        t2 = DerivedTypeVariable(t1, None, labels=[Store(), HasField(64, 0)])
+
+        type_constraints = {
+            func_f: {
+                Subtype(Float64(), t0),
+                Subtype(t0, t2),
+            },
+        }
+        proj = angr.load_shellcode(b"\x90\x90", "AMD64")
+        typehoon = proj.analyses.Typehoon(type_constraints, func_f)
+        soln = typehoon.solution
+
+        assert isinstance(soln[t0], Float64)
+        assert isinstance(soln[t1], Pointer64)
+        assert isinstance(soln[t1].basetype, Float64)
+        assert isinstance(soln[t2], Float64)
+
+    def test_struct_with_multiple_same_typed_members(self):
+        func_f = TypeVariable(name="F")
+        t0 = TypeVariable(name="T0")
+        type_constraints = {
+            func_f: {
+                Subtype(DerivedTypeVariable(t0, None, labels=[Store(), HasField(64, 0)]), t0),
+                Subtype(DerivedTypeVariable(t0, None, labels=[Store(), HasField(64, 8)]), t0),
+            },
+        }
+        proj = angr.load_shellcode(b"\x90\x90", "AMD64")
+        typehoon = proj.analyses.Typehoon(type_constraints, func_f)
+
+        sol = typehoon.solution[t0]
+        assert isinstance(sol, Pointer64)
+        assert isinstance(sol.basetype, Struct)
+        assert len(sol.basetype.fields) == 2
+        assert 0 in sol.basetype.fields
+        assert 8 in sol.basetype.fields
+        assert isinstance(sol.basetype.fields[0], Pointer64)
+        assert sol.basetype.fields[0].basetype == sol.basetype
+        assert isinstance(sol.basetype.fields[8], Pointer64)
+        assert sol.basetype.fields[8].basetype == sol.basetype
+
+    def test_solving_cascading_type_constraints(self):
+        p = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "tiny_aes_test.elf"), auto_load_libs=False)
+        cfg = p.analyses.CFG(data_references=True, normalize=True)
+
+        func = cfg.kb.functions["Cipher"]
+        p.analyses.CompleteCallingConventions()
+        dec = p.analyses.Decompiler(func, cfg=cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print(dec.codegen.text)
+
+        # no masking should exist in the decompilation; all redundant variable type casts are removed
+        assert "& 0x" not in dec.codegen.text
+
+        assert dec.clinic is not None and dec.clinic.typehoon is not None
+        assert 0 < max(dec.clinic.typehoon.eqclass_constraints_count) < 350
 
 
 class TestTypeTranslator(unittest.TestCase):

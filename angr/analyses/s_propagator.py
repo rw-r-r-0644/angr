@@ -6,8 +6,8 @@ from collections import defaultdict
 
 import networkx
 
-from ailment.block import Block
-from ailment.expression import (
+from angr.ailment.block import Block
+from angr.ailment.expression import (
     Const,
     VirtualVariable,
     VirtualVariableCategory,
@@ -16,7 +16,7 @@ from ailment.expression import (
     Convert,
     Expression,
 )
-from ailment.statement import Assignment, Store, Return, Jump, ConditionalJump
+from angr.ailment.statement import Assignment, Store, Return, Jump, ConditionalJump
 
 from angr.knowledge_plugins.functions import Function
 from angr.code_location import CodeLocation, ExternalCodeLocation
@@ -33,6 +33,7 @@ from angr.utils.ssa import (
     is_const_vvar_load_assignment,
     is_const_vvar_load_dirty_assignment,
     is_const_vvar_tmp_assignment,
+    is_vvar_propagatable,
     get_tmp_uselocs,
     get_tmp_deflocs,
     phi_assignment_get_src,
@@ -245,7 +246,7 @@ class SPropagatorAnalysis(Analysis):
                         self.model.dead_vvar_ids.add(vvar.varid)
                         continue
 
-                if vvar.was_reg or vvar.was_parameter:
+                if is_vvar_propagatable(vvar, stmt):
                     if len(vvar_uselocs_set) == 1:
                         vvar_used, vvar_useloc = next(iter(vvar_uselocs_set))
                         if (
@@ -408,9 +409,8 @@ class SPropagatorAnalysis(Analysis):
                             ][tmp_used] = v
                         continue
 
-                    if len(tmp_uses) <= 2:
-                        tmp_used, tmp_use_stmtidx = next(iter(tmp_uses))
-                        if is_const_vvar_load_dirty_assignment(stmt):
+                    if len(tmp_uses) <= 2 and is_const_vvar_load_dirty_assignment(stmt):
+                        for tmp_used, tmp_use_stmtidx in tmp_uses:
                             same_inst = (
                                 block.statements[tmp_def_stmtidx].ins_addr == block.statements[tmp_use_stmtidx].ins_addr
                             )
@@ -425,7 +425,6 @@ class SPropagatorAnalysis(Analysis):
                                 replacements[
                                     CodeLocation(block_loc.block_addr, tmp_use_stmtidx, block_idx=block_loc.block_idx)
                                 ][tmp_used] = stmt.src
-                                continue
 
         self.model.replacements = replacements
 
@@ -510,6 +509,34 @@ class SPropagatorAnalysis(Analysis):
             (stmt_0.false_target.value, stmt_0.false_target_idx),
         }
         return (block_1.addr, block_1.idx) in stmt_0_targets
+
+    @staticmethod
+    def vvar_dep_graph(blocks, vvar_def_locs, vvar_use_locs) -> networkx.DiGraph:
+        g = networkx.DiGraph()
+
+        for var_id in vvar_def_locs:
+            # where is it used?
+            for _, use_loc in vvar_use_locs[var_id]:
+                if isinstance(use_loc, ExternalCodeLocation):
+                    g.add_edge(var_id, "ExternalCodeLocation")
+                    continue
+                assert use_loc.block_addr is not None
+                assert use_loc.stmt_idx is not None
+                block = blocks[(use_loc.block_addr, use_loc.block_idx)]
+                stmt = block.statements[use_loc.stmt_idx]
+                if isinstance(stmt, Assignment):
+                    if isinstance(stmt.dst, VirtualVariable):
+                        g.add_edge(var_id, stmt.dst.varid)
+                    else:
+                        g.add_edge(var_id, f"Assignment@{stmt.ins_addr:#x}")
+                elif isinstance(stmt, Store):
+                    # store to memory
+                    g.add_edge(var_id, f"Store@{stmt.ins_addr:#x}")
+                else:
+                    # other statements
+                    g.add_edge(var_id, f"{stmt.__class__.__name__}@{stmt.ins_addr:#x}")
+
+        return g
 
 
 register_analysis(SPropagatorAnalysis, "SPropagator")

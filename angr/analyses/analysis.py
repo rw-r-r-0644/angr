@@ -1,11 +1,11 @@
-# ruff: noqa: F401
 from __future__ import annotations
 import functools
+import os
 import sys
 import contextlib
 from collections import defaultdict
 from inspect import Signature
-from typing import TYPE_CHECKING, TypeVar, Generic, cast
+from typing import TYPE_CHECKING, TypeVar, Generic, cast, Any
 from collections.abc import Callable
 from types import NoneType
 from itertools import chain
@@ -15,10 +15,11 @@ import logging
 import time
 import typing
 
+import psutil
+
 from rich import progress
 
 from angr.misc.plugins import PluginVendor, VendorPreset
-from angr.misc.ux import deprecated
 from angr.misc import telemetry
 from angr.misc.testing import is_testing
 
@@ -112,7 +113,7 @@ class AnalysisLogEntry:
 A = TypeVar("A", bound="Analysis")
 
 
-class AnalysesHub(PluginVendor[A]):
+class AnalysesHub(PluginVendor[Any]):
     """
     This class contains functions for all the registered and runnable analyses,
     """
@@ -121,14 +122,10 @@ class AnalysesHub(PluginVendor[A]):
         super().__init__()
         self.project = project
 
-    @deprecated()
-    def reload_analyses(self):  # pylint: disable=no-self-use
-        return
-
     def _init_plugin(self, plugin_cls: type[A]) -> AnalysisFactory[A]:
         return AnalysisFactory(self.project, plugin_cls)
 
-    def __getstate__(self):
+    def __getstate__(self):  # type: ignore[reportIncompatibleMethodOverride]
         s = super().__getstate__()
         return (s, self.project)
 
@@ -293,6 +290,8 @@ class Analysis:
     _name: str
     errors: list[AnalysisLogEntry] = []
     named_errors: defaultdict[str, list[AnalysisLogEntry]] = defaultdict(list)
+    _ram_usage: float | None = None
+    _last_ramusage_update: float = 0.0
     _progress_callback = None
     _show_progressbar = False
     _progressbar = None
@@ -301,7 +300,7 @@ class Analysis:
     _PROGRESS_WIDGETS = [
         progress.TaskProgressColumn(),
         progress.BarColumn(),
-        progress.TextColumn("Elapsed Time:"),
+        progress.TextColumn("Elapsed:"),
         progress.TimeElapsedColumn(),
         progress.TextColumn("Time:"),
         progress.TimeRemainingColumn(),
@@ -317,7 +316,9 @@ class Analysis:
                 raise
             else:
                 error = AnalysisLogEntry("exception occurred", exc_info=True)
-                l.error("Caught and logged %s with resilience: %s", error.exc_type.__name__, error.exc_value)
+                l.error(
+                    "Caught and logged %s with resilience: %s", error.exc_type.__name__, error.exc_value  # type:ignore
+                )
                 if name is None:
                     self.errors.append(error)
                 else:
@@ -348,10 +349,12 @@ class Analysis:
             if self._progressbar is None:
                 self._initialize_progressbar()
 
+            assert self._task is not None
+            assert self._progressbar is not None
             self._progressbar.update(self._task, completed=percentage)
 
-        if text is not None and self._progressbar:
-            self._progressbar.update(self._task, description=text)
+            if text is not None and self._progressbar:
+                self._progressbar.update(self._task, description=text)
 
         if self._progress_callback is not None:
             self._progress_callback(percentage, text=text, **kwargs)  # pylint:disable=not-callable
@@ -366,6 +369,7 @@ class Analysis:
             if self._progressbar is None:
                 self._initialize_progressbar()
             if self._progressbar is not None:
+                assert self._task is not None
                 self._progressbar.update(self._task, completed=100)
                 self._progressbar.stop()
                 self._progressbar = None
@@ -390,14 +394,24 @@ class Analysis:
         if ctr != 0 and ctr % freq == 0:
             time.sleep(sleep_time)
 
+    @property
+    def ram_usage(self) -> float:
+        """
+        Return the current RAM usage of the Python process, in bytes. The value is updated at most once per second.
+        """
+
+        if time.time() - self._last_ramusage_update > 1:
+            self._last_ramusage_update = time.time()
+            proc = psutil.Process(os.getpid())
+            meminfo = proc.memory_info()
+            self._ram_usage = meminfo.rss
+        return self._ram_usage if self._ram_usage is not None else -0.1
+
     def __getstate__(self):
         d = dict(self.__dict__)
-        if "_progressbar" in d:
-            del d["_progressbar"]
-        if "_progress_callback" in d:
-            del d["_progress_callback"]
-        if "_statusbar" in d:
-            del d["_statusbar"]
+        d.pop("_progressbar", None)
+        d.pop("_progress_callback", None)
+        d.pop("_statusbar", None)
         return d
 
     def __setstate__(self, state):

@@ -14,7 +14,6 @@ from archinfo.arch_soot import SootAddressDescriptor, ArchSoot
 import cle
 from .sim_procedure import SimProcedure
 
-from .misc.ux import deprecated
 from .errors import AngrNoPluginError
 
 l = logging.getLogger(name=__name__)
@@ -33,7 +32,10 @@ def load_shellcode(shellcode: bytes | str, arch, start_offset=0, load_address=0,
     if not isinstance(arch, archinfo.Arch):
         arch = archinfo.arch_from_id(arch)
     if isinstance(shellcode, str):
-        shellcode_bytes: bytes = arch.asm(shellcode, load_address, thumb=thumb)
+        shellcode_bytes = arch.asm(shellcode, load_address, thumb=thumb)
+        if shellcode_bytes is None:
+            raise ValueError("Could not assemble shellcode")
+        assert isinstance(shellcode_bytes, bytes)
     else:
         shellcode_bytes = shellcode
     if thumb:
@@ -174,7 +176,7 @@ class Project:
 
         # It doesn't make any sense to have auto_load_libs
         # if you have the concrete target, let's warn the user about this.
-        if self.concrete_target and load_options.get("auto_load_libs", None):
+        if self.concrete_target and load_options.get("auto_load_libs"):
             l.critical(
                 "Incompatible options selected for this project, please disable auto_load_libs if "
                 "you want to use a concrete target."
@@ -298,18 +300,26 @@ class Project:
 
         # Step 1: get the set of libraries we are allowed to use to resolve unresolved symbols
         missing_libs = []
+        missing_wincore_dlls = False
         for lib_name in self.loader.missing_dependencies:
             try:
-                missing_libs.append(SIM_LIBRARIES[lib_name])
+                missing_libs.extend(SIM_LIBRARIES[lib_name])
             except KeyError:
                 l.info("There are no simprocedures for missing library %s :(", lib_name)
+                if lib_name.startswith("api-ms-win-"):
+                    missing_wincore_dlls = True
+        if missing_wincore_dlls and "kernel32.dll" not in self.loader.missing_dependencies:
+            # some of the missing api-ms-win-*.dll libraries are actually provided by kernel32.dll
+            missing_libs.extend(SIM_LIBRARIES["kernel32.dll"])
+
         # additionally provide libraries we _have_ loaded as a fallback fallback
         # this helps in the case that e.g. CLE picked up a linux arm libc to satisfy an android arm binary
         for lib in self.loader.all_objects:
             if lib.provides is not None and lib.provides in SIM_LIBRARIES:
-                simlib = SIM_LIBRARIES[lib.provides]
-                if simlib not in missing_libs:
-                    missing_libs.append(simlib)
+                simlibs = SIM_LIBRARIES[lib.provides]
+                for simlib in simlibs:
+                    if simlib not in missing_libs:
+                        missing_libs.append(simlib)
 
         # Step 2: Categorize every "import" symbol in each object.
         # If it's IGNORED, mark it for stubbing
@@ -362,11 +372,13 @@ class Project:
                     owner_name = owner_name.lower()
                 if owner_name not in SIM_LIBRARIES:
                     continue
-                sim_lib = SIM_LIBRARIES[owner_name]
-                if not sim_lib.has_implementation(export.name):
-                    continue
-                l.info("Using builtin SimProcedure for %s from %s", export.name, sim_lib.name)
-                self.hook_symbol(export.rebased_addr, sim_lib.get(export.name, sim_proc_arch))
+                sim_libs = SIM_LIBRARIES[owner_name]
+                for sim_lib in sim_libs:
+                    if not sim_lib.has_implementation(export.name):
+                        continue
+                    l.info("Using builtin SimProcedure for %s from %s", export.name, sim_lib.name)
+                    self.hook_symbol(export.rebased_addr, sim_lib.get(export.name, sim_proc_arch))
+                    break
 
             # Step 2.3: If 2.2 didn't work, check if the symbol wants to be resolved
             # by a library we already know something about. Resolve it appropriately.
@@ -375,7 +387,7 @@ class Project:
             # we still want to try as hard as we can to figure out where it comes from
             # so we can get the calling convention as close to right as possible.
             elif reloc.resolvewith is not None and reloc.resolvewith in SIM_LIBRARIES:
-                sim_lib = SIM_LIBRARIES[reloc.resolvewith]
+                sim_lib = sorted(SIM_LIBRARIES[reloc.resolvewith], key=lambda lib: lib.has_prototype(export.name))[-1]
                 if self._check_user_blacklists(export.name):
                     if not func.is_weak:
                         l.info("Using stub SimProcedure for unresolved %s from %s", func.name, sim_lib.name)
@@ -407,7 +419,7 @@ class Project:
                         if export.name and export.name.startswith("_Z"):
                             # GNU C++ name. Use a C++ library to create the stub
                             if "libstdc++.so" in SIM_LIBRARIES:
-                                the_lib = SIM_LIBRARIES["libstdc++.so"]
+                                the_lib = SIM_LIBRARIES["libstdc++.so"][0]
                             else:
                                 l.critical(
                                     "Does not find any C++ library in SIM_LIBRARIES. We may not correctly "
@@ -437,16 +449,17 @@ class Project:
         """
         # First, filter the SIM_LIBRARIES to a reasonable subset based on the hint
         if hint == "win":
-            hinted_libs = filter(lambda lib: lib if lib.endswith(".dll") else None, SIM_LIBRARIES)
+            hinted_libs = [lib for lib in SIM_LIBRARIES if lib.endswith(".dll")]
         else:
-            hinted_libs = filter(lambda lib: lib if ".so" in lib else None, SIM_LIBRARIES)
+            hinted_libs = [lib for lib in SIM_LIBRARIES if ".so" in lib]
 
         for lib in hinted_libs:
-            if SIM_LIBRARIES[lib].has_implementation(f.name):
-                l.debug("Found implementation for %s in %s", f, lib)
-                hook_at = f.resolvedby.rebased_addr if f.resolvedby else f.relative_addr  # ????
-                self.hook_symbol(hook_at, (SIM_LIBRARIES[lib].get(f.name, self.arch)))
-                return True
+            for simlib in SIM_LIBRARIES[lib]:
+                if simlib.has_implementation(f.name):
+                    l.debug("Found implementation for %s in %s", f, lib)
+                    hook_at = f.resolvedby.rebased_addr if f.resolvedby else f.relative_addr  # ????
+                    self.hook_symbol(hook_at, (simlib.get(f.name, self.arch)))
+                    return True
 
         l.debug("Could not find matching SimProcedure for %s, ignoring.", f.name)
         return False
@@ -826,18 +839,9 @@ class Project:
     def __repr__(self):
         return "<Project %s>" % (self.filename if self.filename is not None else "loaded from stream")
 
-    #
-    # Compatibility
-    #
-
-    @property
-    @deprecated(replacement="simos")
-    def _simos(self):
-        return self.simos
-
 
 from .factory import AngrObjectFactory
-from angr.simos import SimOS, os_mapping
+from .simos import SimOS, os_mapping
 from .analyses.analysis import AnalysesHub, AnalysesHubWithDefault
 from .knowledge_base import KnowledgeBase
 from .procedures import SIM_PROCEDURES, SIM_LIBRARIES

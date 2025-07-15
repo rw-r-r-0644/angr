@@ -7,7 +7,7 @@ from collections.abc import Iterable
 import logging
 
 import networkx
-import ailment
+import angr.ailment as ailment
 
 import angr
 from angr.analyses.decompiler.counters.call_counter import AILBlockCallCounter
@@ -158,10 +158,14 @@ def switch_extract_cmp_bounds(
         return None
 
     # TODO: Add more operations
-    if isinstance(last_stmt.condition, ailment.Expr.BinaryOp) and last_stmt.condition.op == "CmpLE":
+    if isinstance(last_stmt.condition, ailment.Expr.BinaryOp) and last_stmt.condition.op in {"CmpLE", "CmpLT"}:
         if not isinstance(last_stmt.condition.operands[1], ailment.Expr.Const):
             return None
-        cmp_ub = last_stmt.condition.operands[1].value
+        cmp_ub = (
+            last_stmt.condition.operands[1].value
+            if last_stmt.condition.op == "CmpLE"
+            else last_stmt.condition.operands[1].value - 1
+        )
         cmp_lb = 0
         cmp = last_stmt.condition.operands[0]
         if (
@@ -250,6 +254,10 @@ def switch_extract_bitwiseand_jumptable_info(last_stmt: ailment.Stmt.Jump) -> tu
              size=4, endness=Iend_LE) + 0x4530e4<32>))
     )
 
+    Another example:
+
+    Load(addr=(((vvar_9{reg 36} & 0x3<32>) * 0x4<32>) + 0x42cd28<32>), size=4, endness=Iend_LE)
+
     :param last_stmt:   The last statement of the switch-case header node.
     :return:            A tuple of (index expression, lower bound, upper bound), or None
     """
@@ -269,16 +277,20 @@ def switch_extract_bitwiseand_jumptable_info(last_stmt: ailment.Stmt.Jump) -> tu
             continue
         if isinstance(target, ailment.Expr.BinaryOp) and target.op == "Add":
             if isinstance(target.operands[0], ailment.Expr.Const) and isinstance(target.operands[1], ailment.Expr.Load):
-                jump_addr_offset = target.operands[0]
+                jump_addr_offset = target.operands[0].value
                 jumptable_load_addr = target.operands[1].addr
                 break
             if isinstance(target.operands[1], ailment.Expr.Const) and isinstance(target.operands[0], ailment.Expr.Load):
-                jump_addr_offset = target.operands[1]
+                jump_addr_offset = target.operands[1].value
                 jumptable_load_addr = target.operands[0].addr
                 break
             return None
         if isinstance(target, ailment.Expr.Const):
             return None
+        if isinstance(target, ailment.Expr.Load):
+            jumptable_load_addr = target.addr
+            jump_addr_offset = 0
+            break
         break
 
     if jump_addr_offset is None or jumptable_load_addr is None:
@@ -655,7 +667,7 @@ def _flatten_structured_node(packed_node: SequenceNode | MultiNode) -> list[ailm
 
 def _find_node_in_graph(node: ailment.Block, graph: networkx.DiGraph) -> ailment.Block | None:
     for bb in graph:
-        if bb.addr == node.addr and bb.idx == node.idx:
+        if isinstance(bb, ailment.Block) and bb.addr == node.addr and bb.idx == node.idx:
             return bb
     return None
 
@@ -721,6 +733,23 @@ def structured_node_is_simple_return(
             succs = list(graph.successors(last_graph_block))
             return not succs or succs == [last_graph_block]
     return False
+
+
+def structured_node_is_simple_return_strict(node: BaseNode | SequenceNode | MultiNode | ailment.Block) -> bool:
+    """
+    Returns True iff the node exclusively contains a return statement.
+    """
+    if isinstance(node, (SequenceNode, MultiNode)) and node.nodes:
+        flat_blocks = _flatten_structured_node(node)
+        if len(flat_blocks) != 1:
+            return False
+        node = flat_blocks[-1]
+
+    return (
+        isinstance(node, ailment.Block)
+        and len(node.statements) == 1
+        and isinstance(node.statements[0], ailment.Stmt.Return)
+    )
 
 
 def is_statement_terminating(stmt: ailment.statement.Statement, functions) -> bool:
@@ -851,11 +880,16 @@ def peephole_optimize_stmts(block, stmt_opts):
                     r = opt.optimize(stmt, stmt_idx=stmt_idx, block=block)
                     if r is not None and r is not stmt:
                         stmt = r
+                        if r == ():
+                            # the statement is gone; no more redo
+                            redo = False
+                            break
                         redo = True
                         break
 
         if stmt is not None and stmt is not old_stmt:
-            statements.append(stmt)
+            if stmt != ():
+                statements.append(stmt)
             any_update = True
         else:
             statements.append(old_stmt)

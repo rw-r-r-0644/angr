@@ -1,28 +1,33 @@
 # pylint: disable=missing-class-docstring
 from __future__ import annotations
 import glob
+import importlib
 import importlib.resources
 import os
-import platform
 import shutil
 import subprocess
 import sys
 from distutils.command.build import build as st_build
-from distutils.util import get_platform
 
 from setuptools import Command, setup
 from setuptools.command.develop import develop as st_develop
 from setuptools.errors import LibError
 
+# Import setuptools_rust to ensure an error is raised if not installed
+try:
+    _ = importlib.import_module("setuptools_rust")
+except ImportError as err:
+    raise Exception("angr requires setuptools-rust to build") from err
+
 if sys.platform == "darwin":
-    library_file = "angr_native.dylib"
+    library_file = "unicornlib.dylib"
 elif sys.platform in ("win32", "cygwin"):
-    library_file = "angr_native.dll"
+    library_file = "unicornlib.dll"
 else:
-    library_file = "angr_native.so"
+    library_file = "unicornlib.so"
 
 
-def _build_native():
+def build_unicornlib():
     try:
         importlib.import_module("pyvex")
     except ImportError as e:
@@ -47,18 +52,18 @@ def _build_native():
     else:
         cmd = ["make"]
     try:
-        subprocess.run(cmd, cwd="native", env=env, check=True)
+        subprocess.run(cmd, cwd="native/unicornlib", env=env, check=True)
     except FileNotFoundError as err:
         raise LibError("Couldn't find " + cmd[0] + " in PATH") from err
     except subprocess.CalledProcessError as err:
-        raise LibError("Error while building angr_native: " + str(err)) from err
+        raise LibError("Error while building unicornlib: " + str(err)) from err
 
     shutil.rmtree("angr/lib", ignore_errors=True)
     os.mkdir("angr/lib")
-    shutil.copy(os.path.join("native", library_file), "angr/lib")
+    shutil.copy(os.path.join("native/unicornlib", library_file), "angr")
 
 
-def _clean_native():
+def clean_unicornlib():
     oglob = glob.glob("native/*.o")
     oglob += glob.glob("native/*.obj")
     oglob += glob.glob("native/*.so")
@@ -70,11 +75,11 @@ def _clean_native():
 
 class build(st_build):
     def run(self, *args):
-        self.execute(_build_native, (), msg="Building angr_native")
+        self.execute(build_unicornlib, (), msg="Building unicornlib")
         super().run(*args)
 
 
-class clean_native(Command):
+class clean(Command):
     user_options = []
 
     def initialize_options(self):
@@ -84,7 +89,7 @@ class clean_native(Command):
         pass
 
     def run(self):
-        self.execute(_clean_native, (), msg="Cleaning angr_native")
+        self.execute(clean, (), msg="Cleaning unicornlib")
 
 
 class develop(st_develop):
@@ -95,7 +100,7 @@ class develop(st_develop):
 
 cmdclass = {
     "build": build,
-    "clean_native": clean_native,
+    "clean_unicornlib": clean,
     "develop": develop,
 }
 
@@ -112,14 +117,5 @@ try:
 except ModuleNotFoundError:
     pass
 
-
-if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
-    sys.argv.append("--plat-name")
-    name = get_platform()
-    if "linux" in name:
-        sys.argv.append("manylinux2014_" + platform.machine())
-    else:
-        # https://www.python.org/dev/peps/pep-0425/
-        sys.argv.append(name.replace(".", "_").replace("-", "_"))
 
 setup(cmdclass=cmdclass)

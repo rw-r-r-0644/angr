@@ -5,8 +5,8 @@ from typing import Any
 
 import networkx
 
-from ailment import Block
-from ailment.statement import ConditionalJump, Label
+from angr.ailment import Block
+from angr.ailment.statement import ConditionalJump, Label
 
 from .return_duplicator_base import ReturnDuplicatorBase
 from .optimization_pass import StructuringOptimizationPass
@@ -55,6 +55,7 @@ class ReturnDuplicatorLow(StructuringOptimizationPass, ReturnDuplicatorBase):
         region_identifier=None,
         vvar_id_start: int | None = None,
         scratch: dict[str, Any] | None = None,
+        max_func_blocks: int = 500,
         **kwargs,
     ):
         StructuringOptimizationPass.__init__(
@@ -76,6 +77,7 @@ class ReturnDuplicatorLow(StructuringOptimizationPass, ReturnDuplicatorBase):
             ri=region_identifier,
             vvar_id_start=vvar_id_start,
             scratch=scratch,
+            max_func_blocks=max_func_blocks,
         )
         self.analyze()
 

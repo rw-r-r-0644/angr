@@ -8,14 +8,14 @@ from enum import Enum
 
 import networkx
 
-import ailment
+import angr.ailment as ailment
 
 from angr.analyses.decompiler import RegionIdentifier
 from angr.analyses.decompiler.ailgraph_walker import AILGraphWalker
 from angr.analyses.decompiler.condition_processor import ConditionProcessor
 from angr.analyses.decompiler.goto_manager import Goto, GotoManager
 from angr.analyses.decompiler.structuring import RecursiveStructurer, SAILRStructurer
-from angr.analyses.decompiler.utils import add_labels, remove_edges_in_ailgraph
+from angr.analyses.decompiler.utils import add_labels, remove_edges_in_ailgraph, is_empty_node
 from angr.analyses.decompiler.counters import ControlFlowStructureCounter
 from angr.project import Project
 
@@ -53,12 +53,14 @@ class OptimizationPassStage(Enum):
     AFTER_AIL_GRAPH_CREATION = 0
     BEFORE_SSA_LEVEL0_TRANSFORMATION = 1
     AFTER_SINGLE_BLOCK_SIMPLIFICATION = 2
-    AFTER_MAKING_CALLSITES = 3
-    AFTER_GLOBAL_SIMPLIFICATION = 4
-    AFTER_VARIABLE_RECOVERY = 5
-    BEFORE_REGION_IDENTIFICATION = 6
-    DURING_REGION_IDENTIFICATION = 7
-    AFTER_STRUCTURING = 8
+    BEFORE_SSA_LEVEL1_TRANSFORMATION = 3
+    AFTER_MAKING_CALLSITES = 4
+    AFTER_GLOBAL_SIMPLIFICATION = 5
+    BEFORE_VARIABLE_RECOVERY = 6
+    AFTER_VARIABLE_RECOVERY = 7
+    BEFORE_REGION_IDENTIFICATION = 8
+    DURING_REGION_IDENTIFICATION = 9
+    AFTER_STRUCTURING = 10
 
 
 class BaseOptimizationPass:
@@ -137,6 +139,7 @@ class OptimizationPass(BaseOptimizationPass):
         avoid_vvar_ids: set[int] | None = None,
         arg_vvars: set[int] | None = None,
         peephole_optimizations=None,
+        stack_pointer_tracker=None,
         **kwargs,
     ):
         super().__init__(func)
@@ -158,6 +161,7 @@ class OptimizationPass(BaseOptimizationPass):
         self._complete_successors = complete_successors
         self._avoid_vvar_ids = avoid_vvar_ids or set()
         self._peephole_optimizations = peephole_optimizations
+        self._stack_pointer_tracker = stack_pointer_tracker
 
         # output
         self.out_graph: networkx.DiGraph | None = None
@@ -174,6 +178,30 @@ class OptimizationPass(BaseOptimizationPass):
     #
     # Util methods
     #
+
+    def bfs_nodes(self, depth: int | None = None, start_node: ailment.Block | None = None) -> Generator[ailment.Block]:
+        seen = set()
+
+        if start_node is None:
+            start_node = self._get_block(self._func.addr)
+        if start_node is None:
+            return
+
+        queue = [(0, start_node)]
+        while queue:
+            node_depth, node = queue.pop(0)
+            if node in seen:
+                continue
+            seen.add(node)
+
+            yield node
+
+            if depth is not None and node_depth >= depth:
+                continue
+
+            for succ in sorted(self._graph.successors(node), key=lambda x: (x.addr, x.idx if hasattr(x, "idx") else 0)):
+                if succ not in seen:
+                    queue.append((node_depth + 1, succ))
 
     def new_block_addr(self) -> int:
         """
@@ -404,12 +432,13 @@ class StructuringOptimizationPass(OptimizationPass):
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
 
     _initial_gotos: set[Goto]
-    _goto_manager: GotoManager
+    _goto_manager: GotoManager | None
     _prev_graph: networkx.DiGraph
 
     def __init__(
         self,
         func,
+        require_structurable_graph: bool = True,
         prevent_new_gotos: bool = True,
         strictly_less_gotos: bool = False,
         recover_structure_fails: bool = True,
@@ -422,6 +451,7 @@ class StructuringOptimizationPass(OptimizationPass):
         **kwargs,
     ):
         super().__init__(func, **kwargs)
+        self._require_structurable_graph = require_structurable_graph
         self._prevent_new_gotos = prevent_new_gotos
         self._strictly_less_gotos = strictly_less_gotos
         self._recover_structure_fails = recover_structure_fails
@@ -431,6 +461,8 @@ class StructuringOptimizationPass(OptimizationPass):
         self._must_improve_rel_quality = must_improve_rel_quality
         self._readd_labels = readd_labels
         self._edges_to_remove = edges_to_remove or []
+        self._goto_manager = None
+        self._initial_gotos = set()
 
         # relative quality metrics (excludes gotos)
         self._initial_structure_counter = None
@@ -448,12 +480,19 @@ class StructuringOptimizationPass(OptimizationPass):
         if not ret:
             return
 
-        if not self._graph_is_structurable(self._graph, initial=True):
+        # only initialize self._goto_manager if this optimization requires a structurable graph or gotos
+        initial_structurable: bool | None = None
+        if self._require_structurable_graph or self._require_gotos or self._prevent_new_gotos:
+            initial_structurable = self._graph_is_structurable(self._graph, initial=True)
+
+        if self._require_structurable_graph and initial_structurable is False:
             return
 
-        self._initial_gotos = self._goto_manager.gotos.copy()
-        if self._require_gotos and not self._initial_gotos:
-            return
+        if self._require_gotos:
+            assert self._goto_manager is not None
+            self._initial_gotos = self._goto_manager.gotos.copy()
+            if not self._initial_gotos:
+                return
 
         # setup for the very first analysis
         self.out_graph = networkx.DiGraph(self._graph)
@@ -472,7 +511,13 @@ class StructuringOptimizationPass(OptimizationPass):
         if self._readd_labels:
             self.out_graph = add_labels(self.out_graph)
 
-        if not self._graph_is_structurable(self.out_graph, readd_labels=False):
+        if (
+            self._require_structurable_graph
+            and self._max_opt_iters <= 1
+            and not self._graph_is_structurable(self.out_graph, readd_labels=False)
+        ):
+            # fixed-point analysis ensures that the output graph is always structurable, otherwise it clears the output
+            # graph. so we only check the structurability of the graph when fixed-point analysis did not run.
             self.out_graph = None
             return
 
@@ -495,13 +540,16 @@ class StructuringOptimizationPass(OptimizationPass):
             return
 
     def _get_new_gotos(self):
+        assert self._goto_manager is not None
         return self._goto_manager.gotos
 
     def _fixed_point_analyze(self, cache=None):
         had_any_changes = False
         for _ in range(self._max_opt_iters):
-            if self._require_gotos and not self._goto_manager.gotos:
-                break
+            if self._require_gotos:
+                assert self._goto_manager is not None
+                if not self._goto_manager.gotos:
+                    break
 
             # backup the graph before the optimization
             if self._recover_structure_fails and self.out_graph is not None:
@@ -562,7 +610,7 @@ class StructuringOptimizationPass(OptimizationPass):
             _l.warning("Internal structuring failed for OptimizationPass on %s", self._func.name)
             rs = None
 
-        if not rs or not rs.result or not rs.result.nodes or rs.result_incomplete:
+        if not rs or not rs.result or is_empty_node(rs.result) or rs.result_incomplete:
             return False
 
         rs = self.project.analyses.RegionSimplifier(self._func, rs.result, arg_vvars=self._arg_vvars, kb=self.kb)
@@ -620,7 +668,7 @@ class StructuringOptimizationPass(OptimizationPass):
         # Gotos play an important part in readability and control flow structure. We already count gotos in other parts
         # of the analysis, so we don't need to count them here. However, some gotos are worse than others. Much
         # like loops, trading gotos (keeping the same total, but getting worse types), is bad for decompilation.
-        if len(self._initial_gotos) == len(self._goto_manager.gotos) != 0:
+        if self._goto_manager is not None and len(self._initial_gotos) == len(self._goto_manager.gotos) != 0:
             prev_labels = self._initial_structure_counter.goto_targets
             curr_labels = self._current_structure_counter.goto_targets
 

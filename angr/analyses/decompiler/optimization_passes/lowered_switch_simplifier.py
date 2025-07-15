@@ -5,9 +5,9 @@ import logging
 
 import networkx
 
-from ailment import Block, AILBlockWalkerBase
-from ailment.statement import ConditionalJump, Label, Assignment, Jump
-from ailment.expression import VirtualVariable, Expression, BinaryOp, Const, Load
+from angr.ailment import Block, AILBlockWalkerBase
+from angr.ailment.statement import ConditionalJump, Label, Assignment, Jump
+from angr.ailment.expression import VirtualVariable, Expression, BinaryOp, Const, Load
 
 from angr.utils.graph import GraphUtils
 from angr.analyses.decompiler.utils import first_nonlabel_nonphi_statement, remove_last_statement
@@ -20,7 +20,7 @@ from .optimization_pass import MultipleBlocksException, StructuringOptimizationP
 from angr.analyses.decompiler.region_simplifiers.switch_cluster_simplifier import SwitchClusterFinder
 
 if TYPE_CHECKING:
-    from ailment.expression import UnaryOp, Convert
+    from angr.ailment.expression import UnaryOp, Convert
 
 _l = logging.getLogger(name=__name__)
 
@@ -159,6 +159,7 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
     def __init__(self, func, min_distinct_cases=2, **kwargs):
         super().__init__(
             func,
+            require_structurable_graph=False,
             require_gotos=False,
             prevent_new_gotos=False,
             simplify_ail=False,

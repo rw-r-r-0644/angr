@@ -9,7 +9,7 @@ from cle.backends import ELF
 import claripy
 
 from angr.storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
-from angr.sim_type import SimTypeBottom, dereference_simtype
+from angr.sim_type import SimTypeBottom
 from angr.knowledge_plugins.key_definitions.atoms import Atom, Register, MemoryLocation, SpOffset
 from angr.knowledge_plugins.key_definitions.tag import Tag
 from angr.calling_conventions import SimCC
@@ -18,7 +18,7 @@ from angr.knowledge_plugins.key_definitions.definition import Definition
 from angr.knowledge_plugins.functions import Function
 from angr.code_location import CodeLocation, ExternalCodeLocation
 from angr.knowledge_plugins.key_definitions.constants import ObservationPointType
-from angr import SIM_LIBRARIES, SIM_TYPE_COLLECTIONS
+from angr.utils.types import dereference_simtype_by_lib
 
 
 if TYPE_CHECKING:
@@ -221,16 +221,16 @@ class FunctionCallDataUnwrapped(FunctionCallData):
     Typechecks be gone!
     """
 
-    address_multi: MultiValues
-    address: int
+    address_multi: MultiValues  # type: ignore[reportIncompatibleVariableOverride]
+    address: int  # type: ignore[reportIncompatibleVariableOverride]
     symbol: Symbol
-    function: Function
-    name: str
-    cc: SimCC
-    prototype: SimTypeFunction
-    args_atoms: list[set[Atom]]
-    args_values: list[MultiValues]
-    ret_atoms: set[Atom]
+    function: Function  # type: ignore[reportIncompatibleVariableOverride]
+    name: str  # type: ignore[reportIncompatibleVariableOverride]
+    cc: SimCC  # type: ignore[reportIncompatibleVariableOverride]
+    prototype: SimTypeFunction  # type: ignore[reportIncompatibleVariableOverride]
+    args_atoms: list[set[Atom]]  # type: ignore[reportIncompatibleVariableOverride]
+    args_values: list[MultiValues]  # type: ignore[reportIncompatibleVariableOverride]
+    ret_atoms: set[Atom]  # type: ignore[reportIncompatibleVariableOverride]
 
     def __init__(self, inner: FunctionCallData):
         d = dict(inner.__dict__)
@@ -378,7 +378,7 @@ class FunctionHandler:
                     hook = state.analysis.project.symbol_hooked_by(plt_name)
             if data.cc is None and hook is not None:
                 data.cc = hook.cc
-            if data.prototype is None and hook is not None:
+            if data.prototype is None and hook is not None and hook.prototype is not None:
                 data.prototype = hook.prototype.with_arch(state.arch)
                 data.guessed_prototype = hook.guessed_prototype
                 hook_libname = hook.library_name
@@ -399,14 +399,8 @@ class FunctionHandler:
                 if data.function is not None and data.function.prototype_libname
                 else hook_libname
             )
-            type_collections = []
-            if prototype_libname is not None and prototype_libname in SIM_LIBRARIES:
-                prototype_lib = SIM_LIBRARIES[prototype_libname]
-                if prototype_lib.type_collection_names:
-                    for typelib_name in prototype_lib.type_collection_names:
-                        type_collections.append(SIM_TYPE_COLLECTIONS[typelib_name])
-            if type_collections:
-                prototype = dereference_simtype(data.prototype, type_collections).with_arch(state.arch)
+            if prototype_libname is not None:
+                prototype = dereference_simtype_by_lib(data.prototype, prototype_libname)
                 data.prototype = cast(SimTypeFunction, prototype)
 
         if isinstance(data.prototype, SimTypeFunction):
@@ -581,7 +575,7 @@ class FunctionHandler:
         sub_rda = state.analysis.project.analyses.ReachingDefinitions(
             data.function,
             observe_all=state.analysis._observe_all,
-            observation_points=list(state.analysis._observation_points or []).extend(return_observation_points),
+            observation_points=list(state.analysis._observation_points or []) + return_observation_points,
             observe_callback=state.analysis._observe_callback,
             dep_graph=state.dep_graph,
             function_handler=self,
@@ -590,6 +584,7 @@ class FunctionHandler:
         # migrate data from sub_rda to its parent
         state.analysis.function_calls.update(sub_rda.function_calls)
         state.analysis.model.observed_results.update(sub_rda.model.observed_results)
+        state.all_definitions |= sub_rda.all_definitions
 
         sub_ld = get_exit_livedefinitions(data.function, sub_rda.model)
         if sub_ld is not None:

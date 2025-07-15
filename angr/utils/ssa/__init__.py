@@ -6,10 +6,20 @@ from typing import Any, Literal, overload
 import networkx
 
 import archinfo
-from ailment import Expression, Block
-from ailment.expression import VirtualVariable, Const, Phi, Tmp, Load, Register, StackBaseOffset, DirtyExpression, ITE
-from ailment.statement import Statement, Assignment, Call, Store
-from ailment.block_walker import AILBlockWalkerBase
+from angr.ailment import Expression, Block, UnaryOp
+from angr.ailment.expression import (
+    VirtualVariable,
+    Const,
+    Phi,
+    Tmp,
+    Load,
+    Register,
+    StackBaseOffset,
+    DirtyExpression,
+    ITE,
+)
+from angr.ailment.statement import Statement, Assignment, Call, Store, CAS
+from angr.ailment.block_walker import AILBlockWalkerBase
 
 from angr.knowledge_plugins.key_definitions import atoms
 from angr.code_location import CodeLocation
@@ -32,7 +42,7 @@ def get_reg_offset_base_and_size(
 
 def get_reg_offset_base_and_size(
     reg_offset: int, arch: archinfo.Arch, size: int | None = None, resilient: bool = True
-) -> tuple[int, int] | None:
+) -> tuple[int, int | None] | None:
     """
     Translate a given register offset into the offset of its full register and obtain the size of the full register.
 
@@ -79,7 +89,7 @@ def get_reg_offset_base(reg_offset, arch, size=None, resilient=True):
 
 
 def get_vvar_deflocs(
-    blocks, phi_vvars: dict[int, set[int]] | None = None
+    blocks, phi_vvars: dict[int, set[int | None]] | None = None
 ) -> dict[int, tuple[VirtualVariable, CodeLocation]]:
     vvar_to_loc: dict[int, tuple[VirtualVariable, CodeLocation]] = {}
     for block in blocks:
@@ -90,7 +100,7 @@ def get_vvar_deflocs(
                 )
                 if phi_vvars is not None and isinstance(stmt.src, Phi):
                     phi_vvars[stmt.dst.varid] = {
-                        vvar_.varid for src, vvar_ in stmt.src.src_and_vvars if vvar_ is not None
+                        vvar_.varid if vvar_ is not None else None for src, vvar_ in stmt.src.src_and_vvars
                     }
             elif isinstance(stmt, Call):
                 if isinstance(stmt.ret_expr, VirtualVariable):
@@ -126,6 +136,11 @@ def get_tmp_deflocs(blocks) -> dict[CodeLocation, dict[atoms.Tmp, int]]:
         for stmt_idx, stmt in enumerate(block.statements):
             if isinstance(stmt, Assignment) and isinstance(stmt.dst, Tmp):
                 tmp_to_loc[codeloc][atoms.Tmp(stmt.dst.tmp_idx, stmt.dst.bits)] = stmt_idx
+            if isinstance(stmt, CAS):
+                if isinstance(stmt.old_lo, Tmp):
+                    tmp_to_loc[codeloc][atoms.Tmp(stmt.old_lo.tmp_idx, stmt.old_lo.bits)] = stmt_idx
+                if stmt.old_hi is not None and isinstance(stmt.old_hi, Tmp):
+                    tmp_to_loc[codeloc][atoms.Tmp(stmt.old_hi.tmp_idx, stmt.old_hi.bits)] = stmt_idx
 
     return tmp_to_loc
 
@@ -146,7 +161,7 @@ def get_tmp_uselocs(blocks) -> dict[CodeLocation, dict[atoms.Tmp, set[tuple[Tmp,
     return tmp_to_loc
 
 
-def is_const_assignment(stmt: Statement) -> tuple[bool, Const | None]:
+def is_const_assignment(stmt: Statement) -> tuple[bool, Const | StackBaseOffset | None]:
     if isinstance(stmt, Assignment) and isinstance(stmt.src, (Const, StackBaseOffset)):
         return True, stmt.src
     return False, None
@@ -263,6 +278,31 @@ def has_tmp_expr(expr: Expression) -> bool:
     return walker.has_blacklisted_exprs
 
 
+class AILReferenceFinder(AILBlockWalkerBase):
+    """
+    Walks an AIL expression or statement and finds if it contains references to certain expressions.
+    """
+
+    def __init__(self, vvar_id: int):
+        super().__init__()
+        self.vvar_id = vvar_id
+        self.has_references_to_vvar = False
+
+    def _handle_UnaryOp(
+        self, expr_idx: int, expr: UnaryOp, stmt_idx: int, stmt: Statement | None, block: Block | None
+    ) -> Any:
+        if expr.op == "Reference" and isinstance(expr.operand, VirtualVariable) and expr.operand.varid == self.vvar_id:
+            self.has_references_to_vvar = True
+            return None
+        return super()._handle_UnaryOp(expr_idx, expr, stmt_idx, stmt, block)
+
+
+def has_reference_to_vvar(stmt: Statement, vvar_id: int) -> bool:
+    walker = AILReferenceFinder(vvar_id)
+    walker.walk_statement(stmt)
+    return walker.has_references_to_vvar
+
+
 def check_in_between_stmts(
     graph: networkx.DiGraph,
     blocks: dict[tuple[int, int | None], Block],
@@ -343,6 +383,59 @@ def has_load_expr_in_between_stmts(
     )
 
 
+def is_vvar_propagatable(vvar: VirtualVariable, def_stmt: Statement | None) -> bool:
+    if vvar.was_tmp or vvar.was_reg or vvar.was_parameter:
+        return True
+    if vvar.was_stack and isinstance(def_stmt, Assignment):
+        if isinstance(def_stmt.src, Const):
+            return True
+        if (
+            isinstance(def_stmt.src, VirtualVariable)
+            and def_stmt.src.was_stack
+            and def_stmt.src.stack_offset == vvar.stack_offset
+        ):
+            # special case: the following block
+            #   ## Block 401e98
+            #   00 | 0x401e98 | LABEL_401e98:
+            #   01 | 0x401e98 | vvar_227{stack -12} = 𝜙@32b [((4202088, None), vvar_277{stack -12}), ((4202076, None),
+            #                   vvar_278{stack -12})]
+            #   02 | 0x401ea0 | return Conv(32->64, vvar_227{stack -12});
+            # might be simplified to the following block after return duplication
+            #   ## Block 401e98.1
+            #   00 | 0x401e98 | LABEL_401e98__1:
+            #   01 | 0x401e98 | vvar_279{stack -12} = vvar_277{stack -12}
+            #   02 | 0x401ea0 | return Conv(32->64, vvar_279{stack -12});
+            # in this case, vvar_279 is eliminatable.
+            return True
+    return False
+
+
+def is_vvar_eliminatable(vvar: VirtualVariable, def_stmt: Statement | None) -> bool:
+    if vvar.was_tmp or vvar.was_reg or vvar.was_parameter:
+        return True
+    if (  # noqa: SIM103
+        vvar.was_stack
+        and isinstance(def_stmt, Assignment)
+        and isinstance(def_stmt.src, VirtualVariable)
+        and def_stmt.src.was_stack
+        and def_stmt.src.stack_offset == vvar.stack_offset
+    ):
+        # special case: the following block
+        #   ## Block 401e98
+        #   00 | 0x401e98 | LABEL_401e98:
+        #   01 | 0x401e98 | vvar_227{stack -12} = 𝜙@32b [((4202088, None), vvar_277{stack -12}), ((4202076, None),
+        #                   vvar_278{stack -12})]
+        #   02 | 0x401ea0 | return Conv(32->64, vvar_227{stack -12});
+        # might be simplified to the following block after return duplication
+        #   ## Block 401e98.1
+        #   00 | 0x401e98 | LABEL_401e98__1:
+        #   01 | 0x401e98 | vvar_279{stack -12} = vvar_277{stack -12}
+        #   02 | 0x401ea0 | return Conv(32->64, vvar_279{stack -12});
+        # in this case, vvar_279 is eliminatable.
+        return True
+    return False
+
+
 __all__ = (
     "VVarUsesCollector",
     "check_in_between_stmts",
@@ -359,5 +452,6 @@ __all__ = (
     "is_const_vvar_load_assignment",
     "is_const_vvar_load_dirty_assignment",
     "is_phi_assignment",
+    "is_vvar_eliminatable",
     "phi_assignment_get_src",
 )

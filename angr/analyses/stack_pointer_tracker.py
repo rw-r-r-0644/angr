@@ -7,23 +7,22 @@ import re
 import logging
 from collections import defaultdict
 
+import pypcode
 import pyvex
+from archinfo.arch_arm import is_arm_arch
 
 from angr.analyses import ForwardAnalysis, visitors
+from angr.engines import pcode
 from angr.utils.constants import is_alignment_mask
 from angr.analyses import AnalysesHub
 from angr.knowledge_plugins import Function
 from angr.block import BlockNode
 from angr.errors import SimTranslationError
 from angr.calling_conventions import SimStackArg
+from angr.utils.types import dereference_simtype_by_lib
+
 from .analysis import Analysis
 
-try:
-    import pypcode
-    from angr.engines import pcode
-except ImportError:
-    pypcode = None
-    pcode = None
 
 if TYPE_CHECKING:
     from angr.block import Block
@@ -381,6 +380,10 @@ class StackPointerTracker(Analysis, ForwardAnalysis):
             block_start_addr = func.addr if func is not None else block.addr  # type: ignore
             self._reg_value_at_block_start[block_start_addr] = initial_reg_values
 
+        self._itstate_regoffset = None
+        if is_arm_arch(self.project.arch):
+            self._itstate_regoffset = self.project.arch.registers["itstate"][0]
+
         _l.debug("Running on function %r", self._func)
         self._analyze()
 
@@ -514,7 +517,7 @@ class StackPointerTracker(Analysis, ForwardAnalysis):
                 # Setting register values to fresh ones will cause problems down the line when merging with normal
                 # register values happen. therefore, we set their values to BOTTOM. these BOTTOMs will be replaced once
                 # a merge with normal blocks happen.
-                initial_regs = {r: BOTTOM for r in self.reg_offsets}
+                initial_regs = dict.fromkeys(self.reg_offsets, BOTTOM)
 
         return StackPointerTrackerState(
             regs=initial_regs, memory={}, is_tracking_memory=self.track_mem, resilient=self._resilient
@@ -617,18 +620,43 @@ class StackPointerTracker(Analysis, ForwardAnalysis):
                         and is_alignment_mask(arg1_expr.val)
                     ):
                         return arg0_expr
+                    # also handle bitwise-and between constants
+                    if isinstance(arg0_expr, Constant) and isinstance(arg1_expr, Constant):
+                        return Constant(arg0_expr.val & arg1_expr.val)
+                elif expr.op.startswith("Iop_Xor"):
+                    # handle bitwise-xor between constants
+                    arg0_expr = _resolve_expr(arg0)
+                    arg1_expr = _resolve_expr(arg1)
+                    if isinstance(arg0_expr, Constant) and isinstance(arg1_expr, Constant):
+                        return Constant(arg0_expr.val ^ arg1_expr.val)
                 elif expr.op.startswith("Iop_CmpEQ"):
                     arg0_expr = _resolve_expr(arg0)
                     arg1_expr = _resolve_expr(arg1)
                     if isinstance(arg0_expr, (Register, OffsetVal)) and isinstance(arg1_expr, (Register, OffsetVal)):
                         return Eq(arg0_expr, arg1_expr)
+                elif expr.op.startswith("Iop_CmpNE"):
+                    arg0_expr = _resolve_expr(arg0)
+                    arg1_expr = _resolve_expr(arg1)
+                    if isinstance(arg0_expr, Constant) and isinstance(arg1_expr, Constant):
+                        return Constant(1 if arg0_expr.val == arg1_expr.val else 0)
+                elif expr.op.startswith("Iop_Shr"):
+                    arg0_expr = _resolve_expr(arg0)
+                    arg1_expr = _resolve_expr(arg1)
+                    if isinstance(arg0_expr, Constant) and isinstance(arg1_expr, Constant):
+                        return Constant(arg0_expr.val >> arg1_expr.val)
                 raise CouldNotResolveException
             if type(expr) is pyvex.IRExpr.RdTmp and expr.tmp in tmps and tmps[expr.tmp] is not None:
                 return tmps[expr.tmp]
             if type(expr) is pyvex.IRExpr.Const:
                 return Constant(expr.con.value)
             if type(expr) is pyvex.IRExpr.Get:
+                if self._itstate_regoffset is not None and expr.offset == self._itstate_regoffset:
+                    return Constant(0)
                 return state.get(expr.offset)
+            if type(expr) is pyvex.IRExpr.ITE:
+                cond = _resolve_expr(expr.cond)
+                if isinstance(cond, Constant):
+                    return _resolve_expr(expr.iftrue) if cond.val == 1 else _resolve_expr(expr.iffalse)
             if type(expr) is pyvex.IRExpr.Unop:
                 m = IROP_CONVERT_REGEX.match(expr.op)
                 if m is not None:
@@ -646,6 +674,9 @@ class StackPointerTracker(Analysis, ForwardAnalysis):
                     if isinstance(v, Eq):
                         return v
                     return TOP
+            elif type(expr) is pyvex.IRExpr.CCall and expr.callee.name == "armg_calculate_condition":
+                # this is a hack for handling ARM THUMB conditional instructions and may not always work...
+                return Constant(0)
             elif self.track_mem and type(expr) is pyvex.IRExpr.Load:
                 return state.load(_resolve_expr(expr.addr))
             raise CouldNotResolveException
@@ -757,7 +788,8 @@ class StackPointerTracker(Analysis, ForwardAnalysis):
                                     sp_adjusted = True
                                     sp_v = state.regs[self.project.arch.sp_offset]
                                     sp_v -= Constant(stmt.data.con.value)
-                                    state.put(self.project.arch.sp_offset, sp_v, force=True)
+                                    state.put(self.project.arch.sp_offset, sp_v, force=True)  # sp -= OFFSET
+                                    state.put(stmt.offset, Constant(0), force=True)  # rax = 0
                                     break
 
                 callee_cleanups = [
@@ -777,10 +809,15 @@ class StackPointerTracker(Analysis, ForwardAnalysis):
                         if v is BOTTOM:
                             incremented = BOTTOM
                         elif callee.prototype is not None:
+                            proto = (
+                                dereference_simtype_by_lib(callee.prototype, callee.prototype_libname)
+                                if callee.prototype_libname
+                                else callee.prototype
+                            )
                             num_stack_args = len(
                                 [
                                     arg_loc
-                                    for arg_loc in callee.calling_convention.arg_locs(callee.prototype)
+                                    for arg_loc in callee.calling_convention.arg_locs(proto)
                                     if isinstance(arg_loc, SimStackArg)
                                 ]
                             )

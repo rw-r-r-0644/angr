@@ -11,8 +11,9 @@ from typing import Any, TYPE_CHECKING
 from collections.abc import Iterable, Sequence
 
 import archinfo
-from archinfo import ArchARM, ArchPcode
 import cle
+import pypcode
+from archinfo import ArchARM, ArchPcode
 from cachetools import LRUCache
 
 # FIXME: Reusing these errors from pyvex for compatibility. Eventually these
@@ -28,16 +29,7 @@ from angr.errors import SimEngineError, SimTranslationError, SimError
 from angr import sim_options as o
 from angr.block import DisassemblerBlock, DisassemblerInsn
 
-
-try:
-    import pypcode
-except ImportError:
-    pypcode = None
-
-
 if TYPE_CHECKING:
-    # this is to make pyright happy; otherwise it believes pypcode is None
-    import pypcode
     from pypcode import PcodeOp, Context
 
 
@@ -426,6 +418,13 @@ class IRSB:
             exits[self.next] = self.jumpkind
 
         return exits
+
+    @property
+    def is_noop_block(self) -> bool:
+        """
+        Returns True if this block is a no-op block (i.e. it has no instructions and no jumps).
+        """
+        return not any(op.opcode != pypcode.OpCode.IMARK for op in self._ops)
 
     #
     # private methods

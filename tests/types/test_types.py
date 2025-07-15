@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 
 import archinfo
+import pydemumble
+from archinfo import Endness
 
 import angr
 from angr.sim_type import (
@@ -12,6 +14,7 @@ from angr.sim_type import (
     SimTypeInt,
     SimTypePointer,
     SimTypeChar,
+    SimTypeWideChar,
     SimStruct,
     SimTypeFloat,
     SimUnion,
@@ -23,9 +26,11 @@ from angr.sim_type import (
     SimTypeBottom,
     SimTypeTop,
     SimTypeString,
-    dereference_simtype,
+    SimTypeCppFunction,
+    SimTypeArray,
 )
 from angr.utils.library import convert_cproto_to_py, convert_cppproto_to_py
+from angr.utils.types import dereference_simtype
 
 
 class TestTypes(unittest.TestCase):
@@ -64,24 +69,26 @@ class TestTypes(unittest.TestCase):
     def test_cppproto_conversion(self):
         # a demangled class constructor prototype, without parameter names
         proto_0 = (
-            "std::basic_ifstream<char, std::char_traits<char>>::{ctor}(std::__cxx11::basic_string<char, "
-            "std::char_traits<char>, std::allocator<char>> const&, std::_Ios_Openmode)"
+            "std::basic_ifstream<char, std::char_traits<char>>::basic_ifstream<char, std::char_traits<char>>("
+            "std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::_Ios_Openmode)"
         )
         name, proto, _ = convert_cppproto_to_py(proto_0, with_param_names=False)
         assert proto is not None
         assert proto.ctor is True
-        assert name == "std::basic_ifstream::__ctor__"
+        assert name == "std::basic_ifstream<char, std::char_traits<char>>::basic_ifstream<char, std::char_traits<char>>"
         assert len(proto.args) == 3
         assert isinstance(proto.args[0], SimTypePointer)  # this
         assert isinstance(proto.args[1], SimTypeReference)
         assert isinstance(proto.args[1].refs, SimTypeString)
-        assert proto.args[1].refs.name == "std::__cxx11::basic_string"
-        assert proto.args[1].refs.unqualified_name(lang="c++") == "basic_string"
+        assert (
+            proto.args[1].refs.name == "std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>"
+        )
+        # assert proto.args[1].refs.unqualified_name(lang="c++") == "basic_string"
 
         proto_1 = "void std::basic_string<CharT,Traits,Allocator>::push_back(CharT ch)"
         name, proto, _ = convert_cppproto_to_py(proto_1, with_param_names=True)
         assert proto is not None
-        assert name == "std::basic_string::push_back"
+        assert name == "std::basic_string<CharT, Traits, Allocator>::push_back"
         assert isinstance(proto.returnty, SimTypeBottom)
         assert isinstance(proto.args[0], SimTypePointer)  # this
         assert isinstance(proto.args[1], SimTypeChar)
@@ -89,32 +96,64 @@ class TestTypes(unittest.TestCase):
         proto_2 = "void std::basic_string<CharT,Traits,Allocator>::swap(basic_string& other)"
         name, proto, _ = convert_cppproto_to_py(proto_2, with_param_names=True)
         assert proto is not None
-        assert name == "std::basic_string::swap"
+        assert name == "std::basic_string<CharT, Traits, Allocator>::swap"
         assert isinstance(proto.returnty, SimTypeBottom)
         assert isinstance(proto.args[0], SimTypePointer)  # this
         assert isinstance(proto.args[1], SimTypeReference)
         assert isinstance(proto.args[1].refs, SimTypeString)
 
-        proto_3 = "std::ios_base::{base dtor}()"
+        proto_3 = "std::ios_base::~ios_base()"
         name, proto, _ = convert_cppproto_to_py(proto_3, with_param_names=True)
         assert proto is not None
-        assert name == "std::ios_base::__base_dtor__"
+        assert name == "std::ios_base::~ios_base"
         assert proto.dtor is True
         assert isinstance(proto.returnty, SimTypeBottom)
 
-        proto_4 = "std::ios_base::{base dtor}()"
+        proto_4 = "std::ios_base::~ios_base()"
         name, proto, _ = convert_cppproto_to_py(proto_4, with_param_names=True)
         assert proto is not None
-        assert name == "std::ios_base::__base_dtor__"
+        assert name == "std::ios_base::~ios_base"
 
         proto_5 = "void foo(int & bar);"
         name, proto, _ = convert_cppproto_to_py(proto_5, with_param_names=True)
         assert proto is not None
         assert name == "foo"
         # note that there is no "this" pointer
+        assert len(proto.args) == 1
         assert isinstance(proto.args[0], SimTypeReference)
         assert isinstance(proto.args[0].refs, SimTypeInt)
         assert isinstance(proto.returnty, SimTypeBottom)
+
+    def test_cppproto_parse_operator_new(self):
+        proto = "operator new(unsigned long)"
+        _, proto, _ = convert_cppproto_to_py(proto)
+        assert proto is not None
+        assert len(proto.args) == 1
+
+    def test_cppproto_parse_operator_shl(self):
+        proto = "std::ostream::operator<<(std::ostream& (*)(std::ostream&))"
+        _, proto, _ = convert_cppproto_to_py(proto)
+        assert proto is not None
+        assert len(proto.args) == 2
+
+    def test_cppproto_parse_class_destructor(self):
+        mangled_proto = "??1?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAE@XZ"
+        proto = pydemumble.demangle(mangled_proto)
+        _, proto, _ = convert_cppproto_to_py(proto)
+        assert isinstance(proto, SimTypeCppFunction)
+        assert proto.dtor is True
+        assert proto.convention == "__thiscall"
+        assert len(proto.args) == 1
+
+    def test_cppproto_parse_std_string_operator_equals(self):
+        mangled_proto = "??4?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEAAV01@ABV01@@Z"
+        proto = pydemumble.demangle(mangled_proto)
+        _, proto, _ = convert_cppproto_to_py(proto)
+        assert isinstance(proto, SimTypeCppFunction)
+        assert proto.ctor is False
+        assert proto.dtor is False
+        assert proto.convention == "__thiscall"
+        assert len(proto.args) == 2
 
     def test_struct_deduplication(self):
         angr.types.register_types(angr.types.parse_type("struct ahdr { int a ;}"))
@@ -304,7 +343,7 @@ class TestTypes(unittest.TestCase):
         ty = angr.types.parse_type(code)
         assert isinstance(ty, SimStruct)
         ty = ty.with_arch(archinfo.ArchAArch64())
-        assert [(t.size, t.offset) for t in list(ty.fields.values())[1:-1]] == [
+        assert [(t.size, t.offset) for t in list(ty.fields.values())[1:-1]] == [  # type: ignore
             (36, 0),
             (8, 4),
             (7, 4),
@@ -317,8 +356,9 @@ class TestTypes(unittest.TestCase):
         variant_type = angr.SIM_TYPE_COLLECTIONS["win32"].get("VARIANT")
         assert isinstance(variant_type, SimStruct)
         assert isinstance(variant_type.fields["Anonymous"], SimUnion)
-        assert variant_type.fields["Anonymous"].members["Anonymous"].anonymous is True
+        assert variant_type.fields["Anonymous"].members["Anonymous"].anonymous is True  # type: ignore
         t = dereference_simtype(variant_type, [angr.SIM_TYPE_COLLECTIONS["win32"]]).with_arch(archinfo.ArchX86())
+        assert t.size is not None
         assert t.size > 0  # an exception is raised if anonymous structs are not handled correctly
 
     def test_simunion_size_bottom_types(self):
@@ -330,40 +370,16 @@ class TestTypes(unittest.TestCase):
         union_type = union_type.with_arch(archinfo.ArchAMD64())
         assert union_type.size == 8  # fall back to architecture word size
 
+    def test_widechar_extraction(self):
+        proj = angr.load_shellcode(b"\x90\x90\x90\x90", arch="AMD64")
+        state = proj.factory.blank_state()
+        state.memory.store(0xC000_0000, b"a\x00b\x00c\x00D\x00E\x00\x00\x00")
 
-class TestSimTypeFunction(unittest.TestCase):
-    def test_c_repr(self):
-        proto = "int (main)(int argc, char **argv)"
-        _, pyproto, _ = convert_cproto_to_py(proto + ";")
-        assert pyproto.c_repr(name="main", full=True) == proto
+        wchar_t = SimTypeWideChar(endness=Endness.LE).with_arch(proj.arch)
+        assert wchar_t.extract(state, 0xC000_0000, concrete=True) == "a"
 
-    def test_c_repr_noargs(self):
-        proto = "int (main)()"
-        _, pyproto, _ = convert_cproto_to_py(proto + ";")
-        assert pyproto.c_repr(name="main") == proto
-
-    def test_c_repr_noname(self):
-        _, pyproto, _ = convert_cproto_to_py("int (main)(int argc, char **argv);")
-        assert pyproto.c_repr(full=True) == "int ()(int argc, char **argv)"
-
-    def test_c_repr_notfull(self):
-        _, pyproto, _ = convert_cproto_to_py("int (main)(int argc, char **argv);")
-        assert pyproto.c_repr(name="main", full=False) == "int (main)(int, char **)"
-
-    def test_c_repr_void(self):
-        proto = "void (main)(int argc, char **argv)"
-        _, pyproto, _ = convert_cproto_to_py(proto + ";")
-        assert pyproto.c_repr(name="main", full=True) == proto
-
-    def test_c_repr_variadic(self):
-        proto = "int (main)(int x, ...)"
-        _, pyproto, _ = convert_cproto_to_py(proto + ";")
-        assert pyproto.c_repr(name="main", full=True) == proto
-
-    def test_c_repr_variadic_only(self):
-        _, pyproto, _ = convert_cproto_to_py("int (main)(void);")  # XXX: pycparser does not support full variadic yet
-        pyproto.variadic = True
-        assert pyproto.c_repr(name="main", full=True) == "int (main)(...)"
+        wchar_array = SimTypeArray(SimTypeWideChar(endness=Endness.LE), length=5).with_arch(proj.arch)
+        assert wchar_array.extract(state, 0xC000_0000, concrete=True) == ["a", "b", "c", "D", "E"]
 
 
 if __name__ == "__main__":

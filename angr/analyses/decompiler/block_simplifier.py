@@ -4,15 +4,15 @@ import logging
 from typing import TYPE_CHECKING
 from collections.abc import Iterable, Mapping
 
-from ailment.statement import Statement, Assignment, Call, Store, Jump
-from ailment.expression import Tmp, Load, Const, Register, Convert, Expression
-from ailment import AILBlockWalkerBase
-
+from angr.ailment.statement import Statement, Assignment, Call, Store, Jump
+from angr.ailment.expression import Tmp, Load, Const, Register, Convert, Expression, VirtualVariable
+from angr.ailment import AILBlockWalkerBase
 from angr.code_location import ExternalCodeLocation, CodeLocation
-
+from angr.knowledge_plugins.key_definitions import atoms
 from angr.analyses.s_propagator import SPropagatorAnalysis
 from angr.analyses.s_reaching_definitions import SReachingDefinitionsAnalysis, SRDAModel
 from angr.analyses import Analysis, register_analysis
+from angr.utils.ssa import has_reference_to_vvar
 from .peephole_optimizations import (
     MULTI_STMT_OPTS,
     STMT_OPTS,
@@ -25,7 +25,7 @@ from .utils import peephole_optimize_exprs, peephole_optimize_stmts, peephole_op
 
 if TYPE_CHECKING:
     from angr.knowledge_plugins.key_definitions.live_definitions import Definition
-    from ailment.block import Block
+    from angr.ailment.block import Block
 
 
 _l = logging.getLogger(name=__name__)
@@ -62,6 +62,8 @@ class BlockSimplifier(Analysis):
         peephole_optimizations: None | (
             Iterable[type[PeepholeOptimizationStmtBase] | type[PeepholeOptimizationExprBase]]
         ) = None,
+        preserve_vvar_ids: set[int] | None = None,
+        type_hints: list[tuple[atoms.VirtualVariable | atoms.MemoryLocation, str]] | None = None,
         cached_reaching_definitions=None,
         cached_propagator=None,
     ):
@@ -74,24 +76,35 @@ class BlockSimplifier(Analysis):
         self.func_addr = func_addr
 
         self._stack_pointer_tracker = stack_pointer_tracker
+        self._preserve_vvar_ids = preserve_vvar_ids
+        self._type_hints = type_hints
 
         if peephole_optimizations is None:
-            self._expr_peephole_opts = [cls(self.project, self.kb, self.func_addr) for cls in EXPR_OPTS]
-            self._stmt_peephole_opts = [cls(self.project, self.kb, self.func_addr) for cls in STMT_OPTS]
-            self._multistmt_peephole_opts = [cls(self.project, self.kb, self.func_addr) for cls in MULTI_STMT_OPTS]
+            self._expr_peephole_opts = [
+                cls(self.project, self.kb, self.func_addr, self._preserve_vvar_ids, self._type_hints)
+                for cls in EXPR_OPTS
+            ]
+            self._stmt_peephole_opts = [
+                cls(self.project, self.kb, self.func_addr, self._preserve_vvar_ids, self._type_hints)
+                for cls in STMT_OPTS
+            ]
+            self._multistmt_peephole_opts = [
+                cls(self.project, self.kb, self.func_addr, self._preserve_vvar_ids, self._type_hints)
+                for cls in MULTI_STMT_OPTS
+            ]
         else:
             self._expr_peephole_opts = [
-                cls(self.project, self.kb, self.func_addr)
+                cls(self.project, self.kb, self.func_addr, self._preserve_vvar_ids, self._type_hints)
                 for cls in peephole_optimizations
                 if issubclass(cls, PeepholeOptimizationExprBase)
             ]
             self._stmt_peephole_opts = [
-                cls(self.project, self.kb, self.func_addr)
+                cls(self.project, self.kb, self.func_addr, self._preserve_vvar_ids, self._type_hints)
                 for cls in peephole_optimizations
                 if issubclass(cls, PeepholeOptimizationStmtBase)
             ]
             self._multistmt_peephole_opts = [
-                cls(self.project, self.kb, self.func_addr)
+                cls(self.project, self.kb, self.func_addr, self._preserve_vvar_ids, self._type_hints)
                 for cls in peephole_optimizations
                 if issubclass(cls, PeepholeOptimizationMultiStmtBase)
             ]
@@ -233,6 +246,10 @@ class BlockSimplifier(Analysis):
                         # don't replace
                         r = False
                         new_stmt = None
+                    elif isinstance(old, VirtualVariable) and has_reference_to_vvar(stmt, old.varid):
+                        # never replace an l-value with an r-value
+                        r = False
+                        new_stmt = None
                     elif isinstance(stmt, Call) and isinstance(new, Call) and old == stmt.ret_expr:
                         # special case: do not replace the ret_expr of a call statement to another call statement
                         r = False
@@ -316,18 +333,20 @@ class BlockSimplifier(Analysis):
         for idx, stmt in enumerate(block.statements):
             if type(stmt) is Assignment:
                 # tmps can't execute new code
-                if type(stmt.dst) is Tmp and stmt.dst.tmp_idx not in used_tmps:
-                    continue
+                if (type(stmt.dst) is Tmp and stmt.dst.tmp_idx not in used_tmps) or idx in dead_defs_stmt_idx:
+                    # is it assigning to an unused tmp or a dead virgin?
 
-                # is it a dead virgin?
-                if idx in dead_defs_stmt_idx:
                     # does .src involve any Call expressions? if so, we cannot remove it
                     walker = HasCallExprWalker()
                     walker.walk_expression(stmt.src)
                     if not walker.has_call_expr:
                         continue
 
-                if stmt.src == stmt.dst:
+                    if type(stmt.dst) is Tmp and isinstance(stmt.src, Call):
+                        # eliminate the assignment and replace it with the call
+                        stmt = stmt.src
+
+                if isinstance(stmt, Assignment) and stmt.src == stmt.dst:
                     continue
 
             new_statements.append(stmt)

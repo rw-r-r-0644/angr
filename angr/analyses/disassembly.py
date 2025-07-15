@@ -6,12 +6,13 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
-import pyvex
 import archinfo
+import pypcode
+import pyvex
 
 from . import Analysis
-
 from angr.analyses import AnalysesHub
+from angr.engines import pcode
 from angr.errors import AngrTypeError
 from angr.knowledge_plugins import Function
 from angr.utils.library import get_cpp_function_name
@@ -20,16 +21,9 @@ from angr.block import DisassemblerInsn, CapstoneInsn, SootBlockNode
 from angr.codenode import BlockNode
 from .disassembly_utils import decode_instruction
 
-try:
-    from angr.engines import pcode
-    import pypcode
 
-    IRSBType = pyvex.IRSB | pcode.lifter.IRSB
-    IROpObjType = pyvex.stmt.IRStmt | pypcode.PcodeOp
-except ImportError:
-    pcode = None
-    IRSBType = pyvex.IRSB
-    IROpObjType = pyvex.stmt
+IRSBType = pyvex.IRSB | pcode.lifter.IRSB
+IROpObjType = pyvex.stmt.IRStmt | pypcode.PcodeOp
 
 l = logging.getLogger(name=__name__)
 
@@ -928,7 +922,7 @@ class Value(OperandPiece):
             if func is not None and lbl == func.name and func.name != func.demangled_name:
                 # see if lbl == func.name and func.demangled_name != func.name. if so, we prioritize the
                 # demangled name
-                normalized_name = get_cpp_function_name(func.demangled_name, specialized=False, qualified=True)
+                normalized_name = get_cpp_function_name(func.demangled_name)
                 return [normalized_name]
             return [("+" if self.render_with_sign else "") + lbl]
         if func is not None:
@@ -1159,6 +1153,7 @@ class Disassembly(Analysis):
         show_bytes: bool = False,
         ascii_only: bool | None = None,
         color: bool = True,
+        min_edge_depth: int = 0,
     ) -> str:
         """
         Render the disassembly to a string, with optional edges and addresses.
@@ -1288,7 +1283,7 @@ class Disassembly(Analysis):
             for f, t in sorted(edges_by_line, key=lambda e: abs(e[0] - e[1])):
                 add_edge_to_buffer(edge_buf, ref_buf, f, t, lambda s: ansi_color(s, edge_col), ascii_only=ascii_only)
                 add_edge_to_buffer(ref_buf, ref_buf, f, t, ascii_only=ascii_only)
-            max_edge_depth = max(map(len, ref_buf))
+            max_edge_depth = max(*map(len, ref_buf), min_edge_depth)
 
             # Justify edge and combine with disassembly
             for i, line in enumerate(buf):

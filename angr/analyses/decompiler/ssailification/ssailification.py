@@ -5,7 +5,7 @@ from collections import defaultdict
 from itertools import count
 from bisect import bisect_left
 
-from ailment.expression import (
+from angr.ailment.expression import (
     Expression,
     Register,
     StackBaseOffset,
@@ -14,7 +14,7 @@ from ailment.expression import (
     VirtualVariableCategory,
     Load,
 )
-from ailment.statement import Statement, Store
+from angr.ailment.statement import Statement, Store
 
 from angr.knowledge_plugins.functions import Function
 from angr.code_location import CodeLocation
@@ -107,7 +107,7 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
         )
         self.secondary_stackvars = rewriter.secondary_stackvars
         self.out_graph = rewriter.out_graph
-        self.max_vvar_id = rewriter.max_vvar_id
+        self.max_vvar_id: int = rewriter.max_vvar_id if rewriter.max_vvar_id is not None else 0
 
     def _calculate_virtual_variables(
         self,
@@ -134,7 +134,9 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
         if self._ssa_stackvars:
             # for stack variables, we collect all definitions and identify stack variable locations using heuristics
 
-            stackvar_locs = self._synthesize_stackvar_locs([def_ for def_, _ in def_to_loc if isinstance(def_, Store)])
+            stackvar_locs = self._synthesize_stackvar_locs(
+                [def_ for def_, _ in def_to_loc if isinstance(def_, (Store, StackBaseOffset))]
+            )
             # handle function arguments
             if self._func_args:
                 for func_arg in self._func_args:
@@ -173,6 +175,16 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
                         if def_.size in stackvar_locs[off] and def_.size < full_sz:
                             udef_to_defs[("stack", off, def_.size)].add(def_)
                             udef_to_blockkeys[("stack", off, def_.size)].add((loc.block_addr, loc.block_idx))
+            elif isinstance(def_, StackBaseOffset):
+                sz = 1
+                idx_begin = bisect_left(sorted_stackvar_offs, def_.offset)
+                for i in range(idx_begin, len(sorted_stackvar_offs)):
+                    off = sorted_stackvar_offs[i]
+                    if off >= def_.offset + sz:
+                        break
+                    full_sz = max(stackvar_locs[off])
+                    udef_to_defs[("stack", off, full_sz)].add(def_)
+                    udef_to_blockkeys[("stack", off, full_sz)].add((loc.block_addr, loc.block_idx))
             elif isinstance(def_, Tmp):
                 # Tmps are local to each block and do not need phi nodes
                 pass
@@ -211,7 +223,7 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
         return last_frontier
 
     @staticmethod
-    def _synthesize_stackvar_locs(defs: list[Store]) -> dict[int, set[int]]:
+    def _synthesize_stackvar_locs(defs: list[Store | StackBaseOffset]) -> dict[int, set[int]]:
         """
         Derive potential locations (in terms of offsets and sizes) for stack variables based on all stack variable
         definitions provided.
@@ -224,7 +236,11 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
         offs: set[int] = set()
 
         for def_ in defs:
-            if isinstance(def_.addr, StackBaseOffset):
+            if isinstance(def_, StackBaseOffset):
+                stack_off = def_.offset
+                accesses[stack_off].add(-1)  # we will fix it later
+                offs.add(stack_off)
+            elif isinstance(def_, Store) and isinstance(def_.addr, StackBaseOffset):
                 stack_off = def_.addr.offset
                 accesses[stack_off].add(def_.size)
                 offs.add(stack_off)
@@ -233,11 +249,23 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
         locs: dict[int, set[int]] = {}
         for idx, off in enumerate(sorted_offs):
             sorted_sizes = sorted(accesses[off])
-            if idx < len(sorted_offs) - 1:
-                next_off = sorted_offs[idx + 1]
-                allowed_sizes = [sz for sz in sorted_sizes if off + sz <= next_off]
+            if -1 in sorted_sizes:
+                sorted_sizes.remove(-1)
+
+            allowed_sizes = []
+            if not sorted_sizes:
+                # this location is only referenced by a ref; we guess its size
+                if idx < len(sorted_offs) - 1:
+                    next_off = sorted_offs[idx + 1]
+                    sz = next_off - off
+                    if sz > 0:
+                        allowed_sizes = [sz]
             else:
-                allowed_sizes = sorted_sizes
+                if idx < len(sorted_offs) - 1:
+                    next_off = sorted_offs[idx + 1]
+                    allowed_sizes = [sz for sz in sorted_sizes if off + sz <= next_off]
+                else:
+                    allowed_sizes = sorted_sizes
 
             if allowed_sizes:
                 locs[off] = set(allowed_sizes)

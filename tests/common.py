@@ -7,11 +7,13 @@ import subprocess
 from functools import lru_cache
 from collections.abc import Sequence
 from tempfile import NamedTemporaryFile
-
 from unittest import skipIf, skipUnless, skip, SkipTest
+
+import pytest
 
 from angr import load_shellcode, Project
 from angr.analyses import CongruencyCheck
+from angr.misc.testing import is_testing
 import angr.sim_options as so
 
 l = logging.getLogger("angr.tests.common")
@@ -24,7 +26,11 @@ except ImportError:
 bin_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "binaries")
 bin_priv_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "binaries-private")
 
-if not os.path.isdir(bin_location):
+WORKER = is_testing or bool(
+    os.environ.get("WORKER", False)
+)  # this variable controls whether we print the decompilation code or not
+
+if not os.path.isdir(bin_location) and not os.getenv("CI", "") == "true":
     raise Exception(
         "Can't find the angr/binaries repo for holding testcases. "
         "It should be cloned into the same folder as the rest of your angr modules."
@@ -45,6 +51,7 @@ def requires_binaries_private(func):
 
 
 def slow_test(func):
+    pytest.mark.slow(func)
     func.speed = "slow"
     slow_test_env = os.environ["SKIP_SLOW_TESTS"].lower() if "SKIP_SLOW_TESTS" in os.environ else ""
     return skipIf(slow_test_env == "true" or slow_test_env == "1", "Skipping slow test")(func)
@@ -155,3 +162,9 @@ def run_simple_unicorn_congruency_check(thing: Project | bytes | str, arch: str 
         },
     )
     ca.run(depth=depth)
+
+
+def print_decompilation_result(dec):
+    if not WORKER:
+        print("Decompilation result:")
+        print(dec.codegen.text)

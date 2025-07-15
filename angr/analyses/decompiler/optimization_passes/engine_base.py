@@ -2,7 +2,7 @@
 from __future__ import annotations
 import logging
 
-import ailment
+import angr.ailment as ailment
 
 from angr.engines.light import SimEngineLightAIL
 
@@ -73,8 +73,22 @@ class SimplifierAILEngine(
             self.state.store_variable(dst, src)
 
         if (src, dst) != (stmt.src, stmt.dst):
-            return ailment.statement.Assignment(stmt.idx, dst, src, **stmt.tags)
+            return ailment.statement.Assignment(stmt.idx, dst, src, **stmt.tags)  # type:ignore
 
+        return stmt
+
+    def _handle_stmt_WeakAssignment(self, stmt: ailment.statement.WeakAssignment):
+        src = self._expr(stmt.src)
+        dst = self._expr(stmt.dst)
+
+        if (src, dst) != (stmt.src, stmt.dst):
+            return ailment.statement.WeakAssignment(stmt.idx, dst, src, **stmt.tags)  # type:ignore
+
+        return stmt
+
+    def _handle_stmt_CAS(self, stmt: ailment.statement.CAS) -> ailment.statement.CAS:
+        # we assume that we never have to deal with CAS statements at this point; they should have been rewritten to
+        # intrinsics
         return stmt
 
     def _handle_stmt_Store(self, stmt):
@@ -150,7 +164,7 @@ class SimplifierAILEngine(
     def _handle_stmt_DirtyStatement(self, stmt):
         expr = self._expr(stmt.dirty)
         if expr != stmt.dirty:
-            return ailment.statement.DirtyStatement(stmt.idx, expr, **stmt.tags)
+            return ailment.statement.DirtyStatement(stmt.idx, expr, **stmt.tags)  # type:ignore
         return stmt
 
     def _handle_stmt_Label(self, stmt):

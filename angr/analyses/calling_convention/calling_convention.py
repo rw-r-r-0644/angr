@@ -9,12 +9,21 @@ import capstone
 
 from pyvex.stmt import Put
 from pyvex.expr import RdTmp
-import ailment
+import angr.ailment as ailment
 
 from angr.code_location import ExternalCodeLocation
 
-from angr.calling_conventions import SimFunctionArgument, SimRegArg, SimStackArg, SimCC, default_cc
+from angr.calling_conventions import (
+    SimFunctionArgument,
+    SimRegArg,
+    SimStackArg,
+    SimCC,
+    default_cc,
+    SimCCMicrosoftThiscall,
+)
+from angr.errors import SimTranslationError
 from angr.sim_type import (
+    SimTypeCppFunction,
     SimTypeInt,
     SimTypeFunction,
     SimType,
@@ -24,6 +33,7 @@ from angr.sim_type import (
     SimTypeBottom,
     SimTypeFloat,
     SimTypeDouble,
+    parse_cpp_file,
 )
 from angr.sim_variable import SimStackVariable, SimRegisterVariable
 from angr.knowledge_plugins.key_definitions.atoms import Register, MemoryLocation, SpOffset
@@ -152,6 +162,13 @@ class CallingConventionAnalysis(Analysis):
         """
 
         assert self._function is not None
+
+        demangled_name = self._function.demangled_name
+        if demangled_name != self._function.name:
+            r_demangled = self._analyze_demangled_name(demangled_name)
+            if r_demangled is not None:
+                self.cc, self.prototype, self.prototype_libname = r_demangled
+                return
 
         if self._function.is_simprocedure:
             hooker = self.project.hooked_by(self._function.addr)
@@ -347,6 +364,30 @@ class CallingConventionAnalysis(Analysis):
             return cc, prototype, None
 
         return None
+
+    def _analyze_demangled_name(self, name: str) -> tuple[SimCC, SimTypeFunction, str | None] | None:
+        """
+        Analyze a function with a demangled name. Only C++ names are supported for now.
+
+        :param name:    The demangled name of the function.
+        :return:        A tuple of the calling convention, the function type, and the library name if available.
+        """
+        parsed, _ = parse_cpp_file(name)
+        if not parsed or len(parsed) != 1:
+            return None
+        proto = next(iter(parsed.values()))
+        if (
+            isinstance(proto, SimTypeCppFunction)
+            and self.project.simos.name == "Win32"
+            and self.project.arch.name == "X86"
+            and proto.convention == "__thiscall"
+        ):
+            cc_cls = SimCCMicrosoftThiscall
+        else:
+            cc_cls = default_cc(self.project.arch.name, self.project.simos.name)
+            assert cc_cls is not None
+        cc = cc_cls(self.project.arch)
+        return cc, proto, None
 
     def _analyze_function(self) -> tuple[SimCC, SimTypeFunction] | None:
         """
@@ -545,16 +586,23 @@ class CallingConventionAnalysis(Analysis):
             # include its successor.
 
             # Re-lift the target block
-            dst_bb = self.project.factory.block(dst.addr, func.get_block_size(dst.addr), opt_level=1)
+            dst_block_size = func.get_block_size(dst.addr)
+            if dst_block_size is not None and dst_block_size > 0:
+                dst_bb = self.project.factory.block(dst.addr, dst_block_size, opt_level=1)
+                try:
+                    vex_block = dst_bb.vex
+                except SimTranslationError:
+                    # failed to lift the block
+                    continue
 
-            # If there is only one 'IMark' statement in vex --> the target block contains only direct jump
-            if (
-                len(dst_bb.vex.statements) == 1
-                and dst_bb.vex.statements[0].tag == "Ist_IMark"
-                and func.graph.out_degree(dst) == 1
-            ):
-                for _, jmp_dst, jmp_data in func_graph.out_edges(dst, data=True):
-                    subgraph.add_edge(dst, jmp_dst, **jmp_data)
+                # If there is only one 'IMark' statement in vex --> the target block contains only direct jump
+                if (
+                    len(vex_block.statements) == 1
+                    and vex_block.statements[0].tag == "Ist_IMark"
+                    and func.graph.out_degree(dst) == 1
+                ):
+                    for _, jmp_dst, jmp_data in func_graph.out_edges(dst, data=True):
+                        subgraph.add_edge(dst, jmp_dst, **jmp_data)
 
         return subgraph
 
@@ -681,7 +729,7 @@ class CallingConventionAnalysis(Analysis):
                     # no more arguments
                     temp_args.append(None)
             elif isinstance(arg_loc, SimStackArg):
-                if arg_loc.stack_offset in defs_by_stack_offset:
+                if arg_loc.stack_offset - cc.STACKARG_SP_DIFF in defs_by_stack_offset:
                     temp_args.append(arg_loc)
                 else:
                     # no more arguments
@@ -940,7 +988,11 @@ class CallingConventionAnalysis(Analysis):
             for ret_block in self._function.ret_sites:
                 fpretval_updated, retval_updated = False, False
                 fp_reg_size = 0
-                irsb = self.project.factory.block(ret_block.addr, size=ret_block.size).vex
+                try:
+                    irsb = self.project.factory.block(ret_block.addr, size=ret_block.size).vex
+                except SimTranslationError:
+                    # failed to lift the block
+                    continue
                 for stmt in irsb.statements:
                     if isinstance(stmt, Put) and isinstance(stmt.data, RdTmp):
                         reg_size = irsb.tyenv.sizeof(stmt.data.tmp) // self.project.arch.byte_width  # type: ignore

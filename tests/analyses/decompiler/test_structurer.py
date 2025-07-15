@@ -13,6 +13,7 @@ import angr
 import angr.analyses.decompiler
 from angr.analyses import Decompiler
 from angr.analyses.decompiler.structuring import DreamStructurer
+from angr.analyses.decompiler.decompilation_options import get_structurer_option
 
 from tests.common import bin_location
 
@@ -307,6 +308,60 @@ class TestStructurer(unittest.TestCase):
         assert "if" in if_code_corrected
         assert if_code_corrected in full_text
         assert if_code_corrected != full_text
+
+    def test_infallable_switch_with_condition(self):
+        p = angr.Project(
+            os.path.join(test_location, "x86_64", "cgc-linux64", "Simple_Stack_Machine"), auto_load_libs=False
+        )
+        p.analyses.CFGFast(normalize=True)
+        dec = p.analyses[Decompiler]("main", options=[(get_structurer_option(), "Phoenix")])
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print(dec.codegen.text)
+        assert "switch (" in dec.codegen.text
+        # while codegen generates this <= 7 check, it can be optimized away in the C code
+        # WE SHOULD BE ABLE TO UNCOMMENT THIS
+        # assert '<= 7' not in dec.codegen.text
+
+    def test_complete_successor_causing_structuring_a_node_twice(self):
+        proj = angr.Project(
+            os.path.join(
+                test_location, "x86_64", "windows", "1309c8993adeb587e629615eb6838a280f0a1faa6ac74fdb11b80d5bddc1c94f"
+            ),
+            auto_load_libs=False,
+        )
+        cfg = proj.analyses.CFGFast(normalize=True, force_smart_scan=False)
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(0x140071D40, cfg=cfg.model)
+        # it should not raise any exceptions
+        assert dec.codegen is not None and dec.codegen.text is not None
+
+    def test_phoenix_switch_cases_address_loaded_from_memory_node_a_being_region_head(self):
+        proj = angr.Project(
+            os.path.join(
+                test_location, "x86_64", "windows", "7995a0325b446c462bdb6ae10b692eee2ecadd8e888e9d7729befe4412007afb"
+            ),
+            auto_load_libs=False,
+        )
+        cfg = proj.analyses.CFGFast(
+            normalize=True,
+            regions=[(0x1400326C0, 0x1400326C0 + 0x1000)],
+            start_at_entry=False,
+        )
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(0x1400326C0, cfg=cfg.model)
+        # it should not raise any exceptions
+        assert dec.codegen is not None and dec.codegen.text is not None
+        assert dec.codegen.text.count("switch (") == 1
+
+    def test_phoenix_loop_refinement_natural_loop_creation_logic(self):
+        proj = angr.Project(
+            os.path.join(
+                test_location, "i386", "windows", "0c694dfa7ad465bded90c4faf63100c7008b5efc4bc49b38644a9770b42669b0"
+            ),
+            auto_load_libs=False,
+        )
+        cfg = proj.analyses.CFG(force_smart_scan=False, normalize=True)
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(0x408060, cfg=cfg.model)
+        # it should not raise any exceptions
+        assert dec.codegen is not None and dec.codegen.text is not None
 
 
 if __name__ == "__main__":

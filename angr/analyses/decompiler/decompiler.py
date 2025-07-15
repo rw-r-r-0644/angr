@@ -7,7 +7,7 @@ from typing import Any, TYPE_CHECKING
 
 import networkx
 from cle import SymbolType
-import ailment
+import angr.ailment as ailment
 
 from angr.analyses.cfg import CFGFast
 from angr.knowledge_plugins.functions.function import Function
@@ -23,7 +23,7 @@ from .ailgraph_walker import AILGraphWalker
 from .condition_processor import ConditionProcessor
 from .decompilation_options import DecompilationOption
 from .decompilation_cache import DecompilationCache
-from .utils import remove_labels, remove_edges_in_ailgraph
+from .utils import remove_edges_in_ailgraph
 from .sequence_walker import SequenceWalker
 from .structuring.structurer_nodes import SequenceNode
 from .presets import DECOMPILATION_PRESETS, DecompilationPreset
@@ -72,6 +72,9 @@ class Decompiler(Analysis):
         generate_code: bool = True,
         use_cache: bool = True,
         expr_collapse_depth: int = 16,
+        clinic_graph=None,
+        clinic_arg_vvars=None,
+        clinic_start_stage=None,
     ):
         if not isinstance(func, Function):
             func = self.kb.functions[func]
@@ -129,6 +132,9 @@ class Decompiler(Analysis):
         )
 
         self.clinic = None  # mostly for debugging purposes
+        self._clinic_graph = clinic_graph
+        self._clinic_arg_vvars = clinic_arg_vvars
+        self._clinic_start_stage = clinic_start_stage
         self.codegen: CStructuredCodeGenerator | None = None
         self.cache: DecompilationCache | None = None
         self.options_by_class = None
@@ -256,6 +262,9 @@ class Decompiler(Analysis):
                 optimization_scratch=self._optimization_scratch,
                 force_loop_single_exit=self._force_loop_single_exit,
                 complete_successors=self._complete_successors,
+                ail_graph=self._clinic_graph,
+                arg_vvars=self._clinic_arg_vvars,
+                start_stage=self._clinic_start_stage,
                 **self.options_to_params(self.options_by_class["clinic"]),
             )
         else:
@@ -310,12 +319,8 @@ class Decompiler(Analysis):
         # removed!
         remove_edges_in_ailgraph(clinic.graph, clinic.edges_to_remove)
 
-        # Rewrite the graph to remove phi expressions
-        # this is probably optional if we do not pretty-print clinic.graph
-        clinic.graph = self._transform_graph_from_ssa(clinic.graph)
-
         # save the graph before structuring happens (for AIL view)
-        clinic.cc_graph = remove_labels(clinic.copy_graph())
+        clinic.cc_graph = clinic.copy_graph()
 
         codegen = None
         seq_node = None
@@ -348,7 +353,7 @@ class Decompiler(Analysis):
             )
 
             # rewrite the sequence node to remove phi expressions
-            seq_node = self._transform_seqnode_from_ssa(seq_node)
+            seq_node = self.transform_seqnode_from_ssa(seq_node)
 
             # update memory data
             if self._cfg is not None and self._update_memory_data:
@@ -613,9 +618,13 @@ class Decompiler(Analysis):
                     new_type = var_manager.get_variable_type(var)
                     if new_type is not None:
                         self.func.prototype.args = (
-                            self.func.prototype.args[:i] + (new_type,) + self.func.prototype.args[i + 1 :]
+                            *self.func.prototype.args[:i],
+                            new_type,
+                            *self.func.prototype.args[i + 1 :],
                         )
         except Exception:  # pylint:disable=broad-except
+            if self._fail_fast:
+                raise
             l.warning(
                 "Typehoon analysis failed. Variables will not have types. Please report to GitHub.", exc_info=True
             )
@@ -659,15 +668,24 @@ class Decompiler(Analysis):
             memory_data_addrs=added_memory_data_addrs,
         )
 
-    def _transform_graph_from_ssa(self, ail_graph: networkx.DiGraph) -> networkx.DiGraph:
+    def transform_graph_from_ssa(self, ail_graph: networkx.DiGraph) -> networkx.DiGraph:
+        """
+        Translate an SSA AIL graph out of SSA form. This is useful for producing a non-SSA AIL graph for displaying in
+        angr management.
+
+        :param ail_graph:   The AIL graph to transform out of SSA form.
+        :return:            The translated AIL graph.
+        """
+        variable_kb = self._variable_kb
         dephication = self.project.analyses.GraphDephication(
-            self.func, ail_graph, rewrite=True, kb=self.kb, fail_fast=self._fail_fast
+            self.func, ail_graph, rewrite=True, variable_kb=variable_kb, kb=self.kb, fail_fast=self._fail_fast
         )
         return dephication.output
 
-    def _transform_seqnode_from_ssa(self, seq_node: SequenceNode) -> SequenceNode:
+    def transform_seqnode_from_ssa(self, seq_node: SequenceNode) -> SequenceNode:
+        variable_kb = self._variable_kb
         dephication = self.project.analyses.SeqNodeDephication(
-            self.func, seq_node, rewrite=True, kb=self.kb, fail_fast=self._fail_fast
+            self.func, seq_node, rewrite=True, variable_kb=variable_kb, kb=self.kb, fail_fast=self._fail_fast
         )
         return dephication.output
 

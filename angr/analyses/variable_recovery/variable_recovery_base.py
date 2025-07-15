@@ -5,11 +5,13 @@ from collections.abc import Generator, Iterable
 import logging
 from collections import defaultdict
 
+import networkx
+
 import archinfo
 import claripy
 from claripy.annotation import Annotation
 from archinfo import Arch
-from ailment.expression import BinaryOp, StackBaseOffset
+from angr.ailment.expression import BinaryOp, StackBaseOffset
 
 from angr.knowledge_plugins.functions.function import Function
 from angr.project import Project
@@ -86,8 +88,18 @@ class VariableRecoveryBase(Analysis):
     The base class for VariableRecovery and VariableRecoveryFast.
     """
 
-    def __init__(self, func, max_iterations, store_live_variables: bool, vvar_to_vvar: dict[int, int] | None = None):
+    def __init__(
+        self,
+        func,
+        max_iterations,
+        store_live_variables: bool,
+        vvar_to_vvar: dict[int, int] | None = None,
+        func_graph: networkx.DiGraph | None = None,
+        entry_node_addr: int | tuple[int, int | None] | None = None,
+    ):
         self.function = func
+        self.func_graph = func_graph
+        self.entry_node_addr = entry_node_addr
         self.variable_manager = self.kb.variables
 
         self._max_iterations = max_iterations
@@ -120,7 +132,23 @@ class VariableRecoveryBase(Analysis):
 
     def initialize_dominance_frontiers(self):
         # Computer the dominance frontier for each node in the graph
-        df = self.project.analyses.DominanceFrontier(self.function)
+        func_entry = None
+        if self.func_graph is not None:
+            entry_node_addr = self.entry_node_addr if self.entry_node_addr is not None else self.function.addr
+            assert entry_node_addr is not None
+            if isinstance(entry_node_addr, int):
+                func_entry = next(iter(node for node in self.func_graph if node.addr == entry_node_addr))
+            elif isinstance(entry_node_addr, tuple):
+                func_entry = next(
+                    iter(
+                        node
+                        for node in self.func_graph
+                        if node.addr == entry_node_addr[0] and node.idx == entry_node_addr[1]
+                    )
+                )
+            else:
+                raise TypeError(f"Unsupported entry node address type: {type(entry_node_addr)}")
+        df = self.project.analyses.DominanceFrontier(self.function, func_graph=self.func_graph, entry=func_entry)
         self._dominance_frontiers = defaultdict(set)
         for b0, domfront in df.frontiers.items():
             for d in domfront:
@@ -414,15 +442,26 @@ class VariableRecoveryStateBase:
         return mos_self == mos_other
 
     def _make_phi_variable(self, values: set[claripy.ast.BV | claripy.ast.FP]) -> claripy.ast.Base | None:
-        # we only create a new phi variable if the there is at least one variable involved
+        # we create a new phi variable if:
+        # - there are at least two variables
+        # - all variables are of the same size
+        # - all variables and all values are of the same size
         variables = set()
         bits: int | None = None
         for v in values:
-            bits = v.size()
+            if bits is None:
+                bits = v.size()
+            elif bits != v.size():
+                # multiple variable sizes are found; give up
+                return None
             for _, var in self.extract_variables(v):
+                if var.bits != bits:
+                    # variable size does not match the value size; give up
+                    return None
                 variables.add(var)
 
         if len(variables) <= 1:
+            # only one variable is found; we do not need to create a phi variable
             return None
 
         assert self.successor_block_addr is not None

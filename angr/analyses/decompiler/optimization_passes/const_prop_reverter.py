@@ -5,10 +5,10 @@ import itertools
 
 import networkx
 import claripy
-from ailment import Const
-from ailment.block_walker import AILBlockWalkerBase
-from ailment.statement import Call, Statement, ConditionalJump, Assignment, Store, Return
-from ailment.expression import Convert, Register, Expression, Load
+from angr.ailment import Const
+from angr.ailment.block_walker import AILBlockWalkerBase
+from angr.ailment.statement import Call, Statement, ConditionalJump, Assignment, Store, Return
+from angr.ailment.expression import Convert, Register, Expression, Load
 
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from angr.analyses.decompiler.structuring import SAILRStructurer, DreamStructurer
@@ -66,7 +66,7 @@ class PairAILBlockWalker:
         def _handle_call_expr(expr_idx: int, expr: Call, stmt_idx: int, stmt: Statement, block_):
             walked_objs[Call].add(expr)
 
-        _stmt_handlers = {typ: _handle_ail_obj for typ in walked_objs}
+        _stmt_handlers = dict.fromkeys(walked_objs, _handle_ail_obj)
         walker.stmt_handlers = _stmt_handlers
         walker.expr_handlers[Call] = _handle_call_expr
 
@@ -313,7 +313,7 @@ class ConstPropOptReverter(OptimizationPass):
 
                 # construct new constant block
                 new_const_block = const_block.copy()
-                new_const_block.statements = new_const_block.statements[:-1] + [reg_assign] + [symb_return_stmt.copy()]
+                new_const_block.statements = [*new_const_block.statements[:-1], reg_assign, symb_return_stmt.copy()]
                 self._update_block(const_block, new_const_block)
                 self.resolution = True
         else:

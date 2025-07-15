@@ -10,7 +10,7 @@ from angr.sim_variable import SimVariable, SimStackVariable
 from .simple_solver import SimpleSolver
 from .translator import TypeTranslator
 from .typeconsts import Struct, Pointer, TypeConstant, Array, TopType
-from .typevars import Equivalence, Subtype, TypeVariable
+from .typevars import Equivalence, Subtype, TypeVariable, DerivedTypeVariable
 
 if TYPE_CHECKING:
     from angr.sim_type import SimType
@@ -40,6 +40,7 @@ class Typehoon(Analysis):
         must_struct: set[TypeVariable] | None = None,
         stackvar_max_sizes: dict[TypeVariable, int] | None = None,
         stack_offset_tvs: dict[int, TypeVariable] | None = None,
+        constraint_set_degradation_threshold: int = 150,
     ):
         """
 
@@ -57,11 +58,16 @@ class Typehoon(Analysis):
         self._must_struct = must_struct
         self._stackvar_max_sizes = stackvar_max_sizes if stackvar_max_sizes is not None else {}
         self._stack_offset_tvs = stack_offset_tvs if stack_offset_tvs is not None else {}
+        self._constraint_set_degradation_threshold = constraint_set_degradation_threshold
 
         self.bits = self.project.arch.bits
         self.solution = None
         self.structs = None
         self.simtypes_solution = None
+
+        # stats
+        self.processed_constraints_count: int = 0
+        self.eqclass_constraints_count: list[int] = []
 
         # import pprint
         # pprint.pprint(self._var_mapping)
@@ -100,7 +106,8 @@ class Typehoon(Analysis):
                     and not isinstance(type_.pts_to, SimTypeArray)
                 ):
                     type_ = type_.pts_to
-                type_candidates.append(type_)
+                if type_ is not None:
+                    type_candidates.append(type_)
 
             # determine the best type - this logic can be made better!
             if not type_candidates:
@@ -187,6 +194,10 @@ class Typehoon(Analysis):
         if self._ground_truth and self.simtypes_solution is not None:
             self.simtypes_solution.update(self._ground_truth)
 
+    @staticmethod
+    def _resolve_derived(tv: TypeVariable | DerivedTypeVariable) -> TypeVariable:
+        return tv.type_var if isinstance(tv, DerivedTypeVariable) else tv
+
     def _solve(self):
         typevars = set()
         if self._var_mapping:
@@ -198,11 +209,20 @@ class Typehoon(Analysis):
             for constraint in self._constraints[self.func_var]:
                 if isinstance(constraint, Subtype):
                     if isinstance(constraint.sub_type, TypeVariable):
-                        typevars.add(constraint.sub_type)
+                        typevars.add(self._resolve_derived(constraint.sub_type))
                     if isinstance(constraint.super_type, TypeVariable):
-                        typevars.add(constraint.super_type)
-        solver = SimpleSolver(self.bits, self._constraints, typevars, stackvar_max_sizes=self._stackvar_max_sizes)
+                        typevars.add(self._resolve_derived(constraint.super_type))
+
+        solver = SimpleSolver(
+            self.bits,
+            self._constraints,
+            typevars,
+            stackvar_max_sizes=self._stackvar_max_sizes,
+            constraint_set_degradation_threshold=self._constraint_set_degradation_threshold,
+        )
         self.solution = solver.solution
+        self.processed_constraints_count = solver.processed_constraints_count
+        self.eqclass_constraints_count = solver.eqclass_constraints_count
 
     def _specialize(self):
         """
@@ -214,13 +234,16 @@ class Typehoon(Analysis):
         if not self.solution:
             return
 
+        memo = set()
         for tv in list(self.solution.keys()):
             if self._must_struct and tv in self._must_struct:
                 continue
             sol = self.solution[tv]
-            specialized = self._specialize_struct(sol)
+            specialized = self._specialize_struct(sol, memo=memo)
             if specialized is not None:
                 self.solution[tv] = specialized
+            else:
+                memo.add(sol)
 
     def _specialize_struct(self, tc, memo: set | None = None):
         if isinstance(tc, Pointer):
@@ -240,7 +263,11 @@ class Typehoon(Analysis):
                 return field0
 
             # are all fields the same?
-            if len(tc.fields) > 1 and all(tc.fields[off] == field0 for off in offsets):
+            if (
+                len(tc.fields) > 1
+                and not self._is_pointer_to(field0, tc)
+                and all(tc.fields[off] == field0 for off in offsets)
+            ):
                 # are all fields aligned properly?
                 try:
                     alignment = field0.size
@@ -251,11 +278,18 @@ class Typehoon(Analysis):
                     max_offset = offsets[-1]
                     field0_size = 1
                     if not isinstance(field0, TopType):
-                        field0_size = field0.size
+                        try:
+                            field0_size = field0.size
+                        except NotImplementedError:
+                            field0_size = 1
                     count = (max_offset + field0_size) // alignment
                     return Array(field0, count=count)
 
         return None
+
+    @staticmethod
+    def _is_pointer_to(pointer_to: TypeConstant, base_type: TypeConstant) -> bool:
+        return isinstance(pointer_to, Pointer) and pointer_to.basetype == base_type
 
     def _translate_to_simtypes(self):
         """

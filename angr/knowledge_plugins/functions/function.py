@@ -23,10 +23,10 @@ from angr.procedures import SIM_LIBRARIES
 from angr.procedures.definitions import SimSyscallLibrary
 from angr.protos import function_pb2
 from angr.calling_conventions import DEFAULT_CC, default_cc
-from angr.misc.ux import deprecated
 from angr.sim_type import SimTypeFunction, parse_defns
 from angr.calling_conventions import SimCC
 from angr.project import Project
+from angr.utils.library import get_cpp_function_name
 from .function_parser import FunctionParser
 
 l = logging.getLogger(name=__name__)
@@ -92,6 +92,10 @@ class Function(Serializable):
         is_plt: bool | None = None,
         returning=None,
         alignment=False,
+        calling_convention: SimCC | None = None,
+        prototype: SimTypeFunction | None = None,
+        prototype_libname: str | None = None,
+        is_prototype_guessed: bool = True,
     ):
         """
         Function constructor. If the optional parameters are not provided, they will be automatically determined upon
@@ -123,7 +127,7 @@ class Function(Serializable):
         self._retout_sites: set[BlockNode] = set()
         # block nodes (basic block nodes) at whose ends the function terminates
         # in theory, if everything works fine, endpoints == ret_sites | jumpout_sites | callout_sites
-        self._endpoints = defaultdict(set)
+        self._endpoints: defaultdict[str, set[BlockNode]] = defaultdict(set)
 
         self._call_sites = {}
         self.addr = addr
@@ -139,11 +143,11 @@ class Function(Serializable):
         self.retaddr_on_stack = False
         self.sp_delta = 0
         # Calling convention
-        self.calling_convention: SimCC | None = None
+        self.calling_convention = calling_convention
         # Function prototype
-        self.prototype: SimTypeFunction | None = None
-        self.prototype_libname: str | None = None
-        self.is_prototype_guessed: bool = True
+        self.prototype = prototype
+        self.prototype_libname = prototype_libname
+        self.is_prototype_guessed = is_prototype_guessed
         # Whether this function returns or not. `None` means it's not determined yet
         self._returning = None
 
@@ -202,14 +206,17 @@ class Function(Serializable):
         if is_plt is not None:
             self.is_plt = is_plt
         else:
-            # Whether this function is a PLT entry or not is primarily relying on the PLT detection in CLE; it may also
-            # be updated (to True) during CFG recovery.
-            if self.project is None:
-                raise ValueError(
-                    "'is_plt' must be specified if you do not specify a function manager for this new function."
-                )
-
-            self.is_plt = self.project.loader.find_plt_stub_name(addr) is not None
+            if self._function_manager is not None:
+                # use the faster cached version
+                self.is_plt = self._function_manager.is_plt_cached(addr)
+            else:
+                # Whether this function is a PLT entry or not is primarily relying on the PLT detection in CLE; it may
+                # also be updated (to True) during CFG recovery.
+                if self.project is None:
+                    raise ValueError(
+                        "'is_plt' must be specified if you do not specify a function manager for this new function."
+                    )
+                self.is_plt = self.project.loader.find_plt_stub_name(addr) is not None
 
         # Determine the name of this function
         if name is None:
@@ -218,7 +225,7 @@ class Function(Serializable):
             self.is_default_name = False
             self._name = name
         self.previous_names = []
-        self.from_signature = None
+        self.from_signature: str | None = None
 
         # Determine the name the binary where this function is.
         if binary_name is not None:
@@ -238,15 +245,6 @@ class Function(Serializable):
             self._returning = self._get_initial_returning()
 
         self._init_prototype_and_calling_convention()
-
-    @property
-    @deprecated(".is_alignment")
-    def alignment(self):
-        return self.is_alignment
-
-    @alignment.setter
-    def alignment(self, value):
-        self.is_alignment = value
 
     @property
     def name(self):
@@ -357,7 +355,8 @@ class Function(Serializable):
             # we know the size
             size = self._block_sizes[addr]
 
-        block = self._project.factory.block(addr, size=size, byte_string=byte_string)
+        assert self.project is not None
+        block = self.project.factory.block(addr, size=size, byte_string=byte_string)
         if size is None:
             # update block_size dict
             self._block_sizes[addr] = block.size
@@ -460,18 +459,19 @@ class Function(Serializable):
         """
         constants = set()
 
-        if not self._project.loader.main_object.contains_addr(self.addr):
+        assert self.project is not None
+        if not self.project.loader.main_object.contains_addr(self.addr):
             return constants
 
         # FIXME the old way was better for architectures like mips, but we need the initial irsb
         # reanalyze function with a new initial state (use persistent registers)
         # initial_state = self._function_manager._cfg.get_any_irsb(self.addr).initial_state
-        # fresh_state = self._project.factory.blank_state(mode="fastpath")
+        # fresh_state = self.project.factory.blank_state(mode="fastpath")
         # for reg in initial_state.arch.persistent_regs + ['ip']:
         #     fresh_state.registers.store(reg, initial_state.registers.load(reg))
 
         # reanalyze function with a new initial state
-        fresh_state = self._project.factory.blank_state(mode="fastpath")
+        fresh_state = self.project.factory.blank_state(mode="fastpath")
         fresh_state.regs.ip = self.addr
 
         graph_addrs = {x.addr for x in self.graph.nodes() if isinstance(x, BlockNode)}
@@ -486,10 +486,10 @@ class Function(Serializable):
             if state.solver.eval(state.ip) not in graph_addrs:
                 continue
             # don't trace into simprocedures
-            if self._project.is_hooked(state.solver.eval(state.ip)):
+            if self.project.is_hooked(state.solver.eval(state.ip)):
                 continue
             # don't trace outside of the binary
-            if not self._project.loader.main_object.contains_addr(state.solver.eval(state.ip)):
+            if not self.project.loader.main_object.contains_addr(state.solver.eval(state.ip)):
                 continue
             # don't trace unreachable blocks
             if state.history.jumpkind in {
@@ -506,7 +506,7 @@ class Function(Serializable):
             curr_ip = state.solver.eval(state.ip)
 
             # get runtime values from logs of successors
-            successors = self._project.factory.successors(state)
+            successors = self.project.factory.successors(state)
             for succ in successors.flat_successors + successors.unsat_successors:
                 for a in succ.history.recent_actions:
                     for ao in a.all_objects:
@@ -562,7 +562,7 @@ class Function(Serializable):
             f"  SP difference: {self.sp_delta}\n"
             f"  Has return: {self.has_return}\n"
             f"  Returning: {'Unknown' if self.returning is None else self.returning}\n"
-            f"  Alignment: {self.alignment}\n"
+            f"  Alignment: {self.is_alignment}\n"
             f"  Arguments: reg: {self._argument_registers}, stack: {self._argument_stack_variables}\n"
             f"  Blocks: [{', '.join(f'{i:#x}' for i in self.block_addrs)}]\n"
             f"  Cyclomatic Complexity: {self.cyclomatic_complexity}\n"
@@ -612,7 +612,7 @@ class Function(Serializable):
 
     @property
     def size(self):
-        return sum(b.size for b in self.blocks)
+        return sum(self._block_sizes[addr] for addr in self._local_blocks)
 
     @property
     def binary(self):
@@ -620,8 +620,8 @@ class Function(Serializable):
         Get the object this function belongs to.
         :return: The object this function belongs to.
         """
-
-        return self._project.loader.find_object_containing(self.addr, membership_check=False)
+        assert self.project is not None
+        return self.project.loader.find_object_containing(self.addr, membership_check=False)
 
     @property
     def offset(self) -> int:
@@ -698,10 +698,12 @@ class Function(Serializable):
             project = self.project
             if project.is_hooked(addr):
                 hooker = project.hooked_by(addr)
-                name = hooker.display_name
+                if hooker is not None:
+                    name = hooker.display_name
             elif project.simos.is_syscall_addr(addr):
                 syscall_inst = project.simos.syscall_from_addr(addr)
-                name = syscall_inst.display_name
+                if syscall_inst is not None:
+                    name = syscall_inst.display_name
 
         # generate an IDA-style sub_X name
         if name is None:
@@ -727,8 +729,13 @@ class Function(Serializable):
             if hooker is not None:
                 binary_name = hooker.library_name
 
-        if binary_name is None and self.binary is not None and self.binary.binary:
-            binary_name = os.path.basename(self.binary.binary)
+        if binary_name is None:
+            if self._function_manager is not None:
+                # use the faster cached version
+                binary_name = self._function_manager.get_binary_name_cached(self.addr)
+            else:
+                if self.binary is not None and self.binary.binary:
+                    binary_name = os.path.basename(self.binary.binary)
 
         return binary_name
 
@@ -1338,7 +1345,8 @@ class Function(Serializable):
 
     @property
     def callable(self):
-        return self._project.factory.callable(self.addr)
+        assert self.project is not None
+        return self.project.factory.callable(self.addr)
 
     def normalize(self):
         """
@@ -1349,6 +1357,7 @@ class Function(Serializable):
 
         :return: None
         """
+        assert self.project is not None
 
         # let's put a check here
         if self.startpoint is None:
@@ -1357,7 +1366,7 @@ class Function(Serializable):
             return
 
         graph = self.transition_graph
-        end_addresses = defaultdict(list)
+        end_addresses: defaultdict[int, list[BlockNode]] = defaultdict(list)
 
         for block in self.nodes:
             if isinstance(block, BlockNode):
@@ -1377,8 +1386,8 @@ class Function(Serializable):
 
             # Break other nodes
             for n in other_nodes:
-                new_size = get_real_address_if_arm(self._project.arch, smallest_node.addr) - get_real_address_if_arm(
-                    self._project.arch, n.addr
+                new_size = get_real_address_if_arm(self.project.arch, smallest_node.addr) - get_real_address_if_arm(
+                    self.project.arch, n.addr
                 )
                 if new_size == 0:
                     # This is the node that has the same size as the smallest one
@@ -1455,7 +1464,13 @@ class Function(Serializable):
                     )
                 else:
                     # We gotta create a new one
-                    l.error("normalize(): Please report it to Fish/maybe john.")
+                    l.error("normalize(): Please report it to Fish.")
+
+                # update endpoints
+                for sortset in self._endpoints.values():
+                    if n in sortset:
+                        sortset.remove(n)
+                        sortset.add(smallest_node)
 
             end_addresses[end_addr] = [smallest_node]
 
@@ -1511,20 +1526,21 @@ class Function(Serializable):
             lib = SIM_LIBRARIES.get(binary_name, None)
             libraries = set()
             if lib is not None:
-                libraries.add(lib)
+                libraries.update(lib)
 
         else:
             # try all libraries or all libraries that match the given library name hint
             libraries = set()
-            for lib_name, lib in SIM_LIBRARIES.items():
+            for lib_name, libs in SIM_LIBRARIES.items():
                 # TODO: Add support for syscall libraries. Note that syscall libraries have different function
                 #  prototypes for .has_prototype() and .get_prototype()...
-                if not isinstance(lib, SimSyscallLibrary):
-                    if binary_name_hint:
-                        if binary_name_hint.lower() in lib_name.lower():
+                for lib in libs:
+                    if not isinstance(lib, SimSyscallLibrary):
+                        if binary_name_hint:
+                            if binary_name_hint.lower() in lib_name.lower():
+                                libraries.add(lib)
+                        else:
                             libraries.add(lib)
-                    else:
-                        libraries.add(lib)
 
         if not libraries:
             return False
@@ -1581,10 +1597,77 @@ class Function(Serializable):
         # int, long
         return addr
 
+    def is_rust_function(self):
+        ast = pydemumble.demangle(self.name)
+        if ast:
+            nodes = ast.split("::")
+            if len(nodes) >= 2:
+                last_node = nodes[-1]
+                return (
+                    len(last_node) == 17
+                    and last_node.startswith("h")
+                    and all(c in "0123456789abcdef" for c in last_node[1:])
+                )
+        return False
+
+    @staticmethod
+    def _rust_fmt_node(node):
+        result = []
+        rest = node
+        if rest.startswith("_$"):
+            rest = rest[1:]
+        while True:
+            if rest.startswith("."):
+                if len(rest) > 1 and rest[1] == ".":
+                    result.append("::")
+                    rest = rest[2:]
+                else:
+                    result.append(".")
+                    rest = rest[1:]
+            elif rest.startswith("$"):
+                if "$" in rest[1:]:
+                    escape, rest = rest[1:].split("$", 1)
+                else:
+                    break
+
+                unescaped = {"SP": "@", "BP": "*", "RF": "&", "LT": "<", "GT": ">", "LP": "(", "RP": ")", "C": ","}.get(
+                    escape
+                )
+
+                if unescaped is None and escape.startswith("u"):
+                    digits = escape[1:]
+                    if all(c in "0123456789abcdef" for c in digits):
+                        c = chr(int(digits, 16))
+                        if ord(c) >= 32 and ord(c) != 127:
+                            result.append(c)
+                            continue
+                if unescaped:
+                    result.append(unescaped)
+                else:
+                    break
+            else:
+                idx = min((rest.find(c) for c in "$." if c in rest), default=len(rest))
+                result.append(rest[:idx])
+                rest = rest[idx:]
+                if not rest:
+                    break
+        return "".join(result)
+
     @property
     def demangled_name(self):
         ast = pydemumble.demangle(self.name)
+        if self.is_rust_function():
+            nodes = ast.split("::")[:-1]
+            ast = "::".join([Function._rust_fmt_node(node) for node in nodes])
         return ast if ast else self.name
+
+    @property
+    def short_name(self):
+        if self.is_rust_function():
+            ast = pydemumble.demangle(self.name)
+            return Function._rust_fmt_node(ast.split("::")[-2])
+        func_name = get_cpp_function_name(self.demangled_name)
+        return func_name.split("::")[-1]
 
     def get_unambiguous_name(self, display_name: str | None = None) -> str:
         """
@@ -1597,6 +1680,7 @@ class Function(Serializable):
             ::<addr>::<name>   when the function binary is an unnamed non-main object, or when multiple functions with
                                the same name are defined in the function binary.
         """
+        assert self.project is not None
         must_disambiguate_by_addr = self.binary is not self.project.loader.main_object and self.binary_name is None
 
         # If there are multiple functions with the same name in the same object, disambiguate by address
@@ -1610,11 +1694,12 @@ class Function(Serializable):
         n = separator
         if must_disambiguate_by_addr:
             n += hex(self.addr) + separator
-        elif self.binary is not self.project.loader.main_object:
+        elif self.binary is not self.project.loader.main_object and self.binary_name is not None:
             n += self.binary_name + separator
         return n + (display_name or self.name)
 
     def apply_definition(self, definition: str, calling_convention: SimCC | type[SimCC] | None = None) -> None:
+        assert self.project is not None
         if not definition.endswith(";"):
             definition += ";"
         func_def = parse_defns(definition, arch=self.project.arch)
@@ -1677,7 +1762,7 @@ class Function(Serializable):
         func.calling_convention = self.calling_convention
         func.prototype = self.prototype
         func._returning = self._returning
-        func.alignment = self.is_alignment
+        func.is_alignment = self.is_alignment
         func.startpoint = self.startpoint
         func._addr_to_block_node = self._addr_to_block_node.copy()
         func._block_sizes = self._block_sizes.copy()
